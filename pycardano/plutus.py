@@ -15,7 +15,7 @@ from nacl.encoding import RawEncoder
 from nacl.hash import blake2b
 from typeguard import typechecked
 
-from pycardano.cbor import cbor2
+from pycardano.cbor import FrozenDict, cbor2
 from pycardano.exception import DeserializeException, InvalidArgumentException
 from pycardano.hash import DATUM_HASH_SIZE, SCRIPT_HASH_SIZE, DatumHash, ScriptHash
 from pycardano.nativescript import NativeScript
@@ -28,6 +28,7 @@ from pycardano.serialization import (
     Primitive,
     RawCBOR,
     default_encoder,
+    dumps,
     limit_primitive_type,
 )
 
@@ -77,9 +78,9 @@ class CostModels(DictCBORSerializable):
                 # See:
                 # https://github.com/input-output-hk/cardano-ledger/blob/c9512ec56cd9b9ea20adea567649410289da0acc/eras/alonzo/test-suite/cddl-files/alonzo.cddl#L111-L115
                 # https://github.com/input-output-hk/cardano-ledger/issues/2512
-                l_cbor = cbor2.dumps(language, default=default_encoder)
+                l_cbor = dumps(language, default=default_encoder)
                 cm = IndefiniteList([cost_model[k] for k in sorted(cost_model.keys())])
-                result[l_cbor] = cbor2.dumps(cm, default=default_encoder)
+                result[l_cbor] = dumps(cm, default=default_encoder)
             else:
                 result[language] = [cost_model[k] for k in cost_model.keys()]
         return result
@@ -834,9 +835,9 @@ class RawPlutusData(CBORSerializable):
                 return {"bytes": obj.hex()}
             elif isinstance(obj, ByteString):
                 return {"bytes": obj.value.hex()}
-            elif isinstance(obj, IndefiniteList) or isinstance(obj, list):
+            elif isinstance(obj, (IndefiniteList, list, tuple)):
                 return {"list": [_dfs(item) for item in obj]}
-            elif isinstance(obj, dict):
+            elif isinstance(obj, (dict, FrozenDict)):
                 return {"map": [{"v": _dfs(v), "k": _dfs(k)} for k, v in obj.items()]}
             elif isinstance(obj, CBORTag):
                 constructor, fields = get_constructor_id_and_fields(obj)
@@ -864,7 +865,19 @@ class RawPlutusData(CBORSerializable):
         PlutusData, dict, int, bytes, IndefiniteList, RawCBOR, CBORTag
     )  # equal to RawDatum parameter list
     def from_primitive(cls: Type[RawPlutusData], value: RawDatum) -> RawPlutusData:
-        return cls(value)
+        def _normalize(obj):
+            # cbor2 6.x decodes arrays nested inside a CBORTag value as tuples
+            # (immutable mode). Normalize them back to lists so that decoded
+            # RawPlutusData compares equal to a programmatically constructed one
+            # and downstream list handling works. This is byte-safe because
+            # to_primitive re-derives the indefinite/definite framing.
+            if isinstance(obj, CBORTag) and isinstance(obj.value, tuple):
+                return CBORTag(tag=obj.tag, value=[_normalize(v) for v in obj.value])
+            elif isinstance(obj, CBORTag) and isinstance(obj.value, list):
+                return CBORTag(tag=obj.tag, value=[_normalize(v) for v in obj.value])
+            return obj
+
+        return cls(_normalize(value))
 
     @classmethod
     def from_dict(cls: Type[RawPlutusData], data: dict) -> RawPlutusData:
@@ -932,7 +945,7 @@ Datum = Union[PlutusData, dict, int, bytes, IndefiniteList, RawCBOR, RawPlutusDa
 def datum_hash(datum: Datum) -> DatumHash:
     return DatumHash(
         blake2b(
-            cbor2.dumps(datum, default=default_encoder),
+            dumps(datum, default=default_encoder),
             DATUM_HASH_SIZE,
             encoder=RawEncoder,
         )

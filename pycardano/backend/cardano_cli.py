@@ -33,7 +33,7 @@ from pycardano.hash import DatumHash, ScriptHash
 from pycardano.nativescript import NativeScript
 from pycardano.network import Network
 from pycardano.plutus import Datum, PlutusV1Script, PlutusV2Script, RawPlutusData
-from pycardano.serialization import RawCBOR
+from pycardano.serialization import RawCBOR, loads
 from pycardano.transaction import (
     Asset,
     AssetName,
@@ -406,12 +406,12 @@ class CardanoCliChainContext(ChainContext):
         script_json: JsonDict = reference_script["script"]
         if script_type == "PlutusScriptV1":
             v1script = PlutusV1Script(
-                cbor2.loads(bytes.fromhex(script_json["cborHex"]))
+                loads(bytes.fromhex(script_json["cborHex"]))
             )
             return v1script
         elif script_type == "PlutusScriptV2":
             v2script = PlutusV2Script(
-                cbor2.loads(bytes.fromhex(script_json["cborHex"]))
+                loads(bytes.fromhex(script_json["cborHex"]))
             )
             return v2script
         else:

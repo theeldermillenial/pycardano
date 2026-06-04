@@ -348,7 +348,9 @@ def test_clone_raw_plutus_data():
     assert cloned_tag == tag
     assert cloned_tag.to_cbor_hex() == tag.to_cbor_hex()
 
-    tag.data.value = [1001]
+    # cbor2 6.x CBORTag is immutable (its `value` is read-only), so exercise the
+    # clone-independence check by reassigning the tag rather than mutating in place.
+    tag.data = CBORTag(121, [1001])
 
     assert cloned_tag != tag
 

@@ -34,14 +34,10 @@ from typing import (
 from pycardano.cbor import cbor2
 from pycardano.logging import logger
 
-# Remove the semantic decoder for 258 (CBOR tag for set) as we care about the order of elements
-try:
-    cbor2._decoder.semantic_decoders.pop(258)
-except Exception as e:
-    logger.warning("Failed to remove semantic decoder for CBOR tag 258", e)
-    pass
+from cbor2 import CBOREncoder, CBORSimpleValue, CBORTag, undefined
+from cbor2 import dumps as _cbor2_dumps
 
-from cbor2 import CBOREncoder, CBORSimpleValue, CBORTag, FrozenDict, dumps, undefined
+from pycardano.cbor import FrozenDict
 from frozenlist import FrozenList
 from pprintpp import pformat
 
@@ -64,6 +60,9 @@ __all__ = [
     "OrderedSet",
     "NonEmptyOrderedSet",
     "CodedSerializable",
+    "loads",
+    "dumps",
+    "ENCODERS",
 ]
 
 T = TypeVar("T")
@@ -194,22 +193,57 @@ def limit_primitive_type(*allowed_types):
 CBORBase = TypeVar("CBORBase", bound="CBORSerializable")
 
 
-def decode_array(self, subtype: int) -> Sequence[Any]:
-    # Major tag 4
-    if subtype == 31:
-        # Indefinite length array — delegate to the original decoder, then wrap
-        # the result in IndefiniteFrozenList to preserve indefinite encoding.
-        ret = IndefiniteFrozenList(list(self.decode_array(subtype=subtype)))
-        ret.freeze()
-        return ret
-    else:
-        return self.decode_array(subtype=subtype)
+def _array_hook(value, indefinite):
+    if indefinite:
+        out = IndefiniteFrozenList(list(value))
+        out.freeze()
+        return out
+    return value
 
 
-try:
-    cbor2._decoder.major_decoders[4] = decode_array
-except Exception as e:
-    logger.warning("Failed to replace major decoder for indefinite array", e)
+def _enc_indef(encoder, value):
+    encoder.write(b"\x9f")
+    for item in value:
+        encoder.encode(item)
+    encoder.write(b"\xff")
+
+
+def _normalize_immutable(value):
+    """Recursively convert the immutable containers cbor2 6.x produces inside
+    CBORTag values (``tuple`` for arrays, :class:`cbor2.frozendict` for maps)
+    back into the mutable ``list`` / ``dict`` types pycardano expects for
+    ``Any``-typed payloads (e.g. transaction metadata).
+
+    :class:`IndefiniteList` / :class:`IndefiniteFrozenList` are intentionally
+    preserved so that indefinite-length framing survives re-encoding.
+    """
+    if isinstance(value, (IndefiniteList, IndefiniteFrozenList)):
+        return value
+    if isinstance(value, tuple):
+        return [_normalize_immutable(v) for v in value]
+    if isinstance(value, list):
+        return [_normalize_immutable(v) for v in value]
+    if isinstance(value, FrozenDict) and not isinstance(value, dict):
+        return {k: _normalize_immutable(v) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {k: _normalize_immutable(v) for k, v in value.items()}
+    return value
+
+
+ENCODERS = {IndefiniteList: _enc_indef, IndefiniteFrozenList: _enc_indef}
+_KEEP_258 = {258: lambda item, immutable: CBORTag(258, item)}
+
+
+def loads(payload, **kw):
+    return cbor2.loads(
+        payload, array_hook=_array_hook, semantic_decoders=_KEEP_258, **kw
+    )
+
+
+def dumps(obj, *, default=None, **kw):
+    if default is None:
+        default = default_encoder
+    return _cbor2_dumps(obj, default=default, encoders=ENCODERS, **kw)
 
 
 def default_encoder(
@@ -539,7 +573,7 @@ class CBORSerializable:
 
         assert isinstance(payload, bytes)
 
-        value = cbor2.loads(payload)
+        value = loads(payload)
 
         return cls.from_primitive(value)
 
@@ -711,6 +745,20 @@ def _restore_typed_primitive(
             except TypeError:
                 pass
 
+    # cbor2 6.x decodes containers nested inside a CBORTag value using immutable
+    # types (tuple instead of list, frozendict instead of dict). Normalize them to
+    # the mutable types the bare-`dict`/`list` field hints expect. IndefiniteList /
+    # IndefiniteFrozenList are intentionally NOT normalized here so their indefinite
+    # framing survives re-encoding.
+    if t is dict and isinstance(v, FrozenDict) and not isinstance(v, dict):
+        v = dict(v)
+    elif (
+        t is list
+        and isinstance(v, tuple)
+        and not isinstance(v, IndefiniteList)
+    ):
+        v = list(v)
+
     if t is Any or (t in PRIMITIVE_TYPES and isinstance(v, t)):
         return v
     elif is_cbor_serializable:
@@ -726,9 +774,11 @@ def _restore_typed_primitive(
                 f"List types need exactly one type argument, but got {t_args}"
             )
         t_subtype = t_args[0]
-        if not isinstance(v, (list, IndefiniteList)):
+        if not isinstance(v, (list, tuple, IndefiniteList)):
             raise DeserializeException(f"Expected type list but got {type(v)}")
         v_list = [_restore_typed_primitive(t_subtype, w) for w in v]
+        if isinstance(v, tuple):
+            return list(v_list)
         return v.__class__(v_list)
     elif isclass(t) and t == ByteString:
         if not isinstance(v, bytes):
@@ -742,7 +792,7 @@ def _restore_typed_primitive(
             )
         key_t = t_args[0]
         val_t = t_args[1]
-        if not isinstance(v, dict):
+        if not isinstance(v, (dict, FrozenDict)):
             raise DeserializeException(f"Expected dict type but got {type(v)}")
         return {
             _restore_typed_primitive(key_t, key): _restore_typed_primitive(val_t, val)
@@ -1084,8 +1134,8 @@ class DictCBORSerializable(CBORSerializable):
         return dict(sorted(self.data.items(), key=lambda x: _get_sortable_val(x[0])))
 
     @classmethod
-    @limit_primitive_type(dict)
-    def from_primitive(cls: Type[DictBase], value: dict) -> DictBase:
+    @limit_primitive_type(dict, FrozenDict)
+    def from_primitive(cls: Type[DictBase], value: Union[dict, FrozenDict]) -> DictBase:
         """Restore a primitive value to its original class type.
 
         Args:
@@ -1109,7 +1159,7 @@ class DictCBORSerializable(CBORSerializable):
                 cls.VALUE_TYPE.from_primitive(v)  # type: ignore
                 if isclass(cls.VALUE_TYPE)
                 and issubclass(cls.VALUE_TYPE, CBORSerializable)
-                else v
+                else _normalize_immutable(v)
             )
             restored[k] = v
         return restored
@@ -1219,9 +1269,10 @@ class OrderedSet(Generic[T], CBORSerializable):
         type_arg = type_args[0] if type_args else None
 
         if isinstance(value, CBORTag) and value.tag == 258:
+            inner = value.value
             if isclass(type_arg) and issubclass(type_arg, CBORSerializable):
-                value.value = [type_arg.from_primitive(v) for v in value.value]
-            return cls(value.value, use_tag=True)
+                inner = [type_arg.from_primitive(v) for v in value.value]
+            return cls(inner, use_tag=True)
 
         use_tag = isinstance(value, set)
 

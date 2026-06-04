@@ -21,7 +21,7 @@ from pycardano.hash import SCRIPT_HASH_SIZE, DatumHash, ScriptHash
 from pycardano.nativescript import NativeScript
 from pycardano.network import Network
 from pycardano.plutus import ExecutionUnits, PlutusScript, ScriptType, script_hash
-from pycardano.serialization import RawCBOR
+from pycardano.serialization import RawCBOR, loads
 from pycardano.transaction import (
     Asset,
     AssetName,
@@ -40,7 +40,7 @@ def _try_fix_script(scripth: str, script: PlutusScript) -> PlutusScript:
     if str(script_hash(script)) == scripth:
         return script
     else:
-        new_script = script.__class__(cbor2.loads(script))
+        new_script = script.__class__(loads(script))
         if str(script_hash(new_script)) == scripth:
             return new_script
         else:

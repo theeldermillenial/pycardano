@@ -26,7 +26,12 @@ from pycardano.exception import (
 )
 from pycardano.hash import VERIFICATION_KEY_HASH_SIZE, ScriptHash, VerificationKeyHash
 from pycardano.network import Network
-from pycardano.serialization import CBORSerializable, limit_primitive_type
+from pycardano.serialization import (
+    CBORSerializable,
+    dumps,
+    limit_primitive_type,
+    loads,
+)
 
 __all__ = ["AddressType", "PointerAddress", "Address"]
 
@@ -339,14 +344,14 @@ class Address(CBORSerializable):
 
     def __bytes__(self):
         if self.is_byron:
-            payload = cbor2.dumps(
+            payload = dumps(
                 [
                     self._byron_payload_hash,
                     self._byron_attributes,
                     self._byron_type,
                 ]
             )
-            return cbor2.dumps([CBORTag(24, payload), self._byron_crc32])
+            return dumps([CBORTag(24, payload), self._byron_crc32])
 
         payment = self.payment_part or bytes()
         if self.staking_part is None:
@@ -420,7 +425,7 @@ class Address(CBORSerializable):
         # At this point, value is always bytes
         # Check if it's a Byron address (CBOR with tag 24)
         try:
-            decoded = cbor2.loads(value)
+            decoded = loads(value)
             if isinstance(decoded, (tuple, list)) and len(decoded) == 2:
                 if isinstance(decoded[0], CBORTag) and decoded[0].tag == 24:
                     # This is definitely a Byron address - validate and decode it
@@ -517,7 +522,7 @@ class Address(CBORSerializable):
             DecodingException: When decoding fails.
         """
         try:
-            decoded = cbor2.loads(cbor_bytes)
+            decoded = loads(cbor_bytes)
         except Exception as e:
             raise DecodingException(f"Failed to decode CBOR bytes: {e}")
 
@@ -547,7 +552,7 @@ class Address(CBORSerializable):
             )
 
         try:
-            payload = cbor2.loads(payload_cbor)
+            payload = loads(payload_cbor)
         except Exception as e:
             raise DecodingException(f"Failed to decode Byron address payload: {e}")
 
@@ -598,7 +603,7 @@ class Address(CBORSerializable):
             network_bytes = self._byron_attributes[2]
             if isinstance(network_bytes, bytes):
                 try:
-                    network_discriminant = cbor2.loads(network_bytes)
+                    network_discriminant = loads(network_bytes)
                     # Mainnet: 764824073 (0x2D964A09), Testnet: 1097911063 (0x42659F17)
                     if network_discriminant == 1097911063:
                         return Network.TESTNET

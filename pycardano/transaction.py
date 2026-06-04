@@ -40,8 +40,10 @@ from pycardano.serialization import (
     OrderedSet,
     Primitive,
     default_encoder,
+    dumps,
     limit_primitive_type,
     list_hook,
+    loads,
 )
 from pycardano.types import typechecked
 from pycardano.witness import TransactionWitnessSet
@@ -378,7 +380,7 @@ class _DatumOption(ArrayCBORSerializable):
     def to_shallow_primitive(self) -> Primitive:
         data: Union[CBORTag, DatumHash]
         if self._TYPE == 1:
-            data = CBORTag(24, cbor2.dumps(self.datum, default=default_encoder))
+            data = CBORTag(24, dumps(self.datum, default=default_encoder))
         else:
             data = self.datum
         return [self._TYPE, data]
@@ -394,7 +396,7 @@ class _DatumOption(ArrayCBORSerializable):
             return _DatumOption(DatumHash(values[1]))
         else:
             assert isinstance(values[1], CBORTag)
-            v = cbor2.loads(values[1].value)
+            v = loads(values[1].value)
             if isinstance(v, CBORTag):
                 return _DatumOption(RawPlutusData.from_primitive(v))
             else:
@@ -406,14 +408,14 @@ class _ScriptRef(CBORSerializable):
     script: _Script
 
     def to_primitive(self) -> Primitive:
-        return CBORTag(24, cbor2.dumps(self.script, default=default_encoder))
+        return CBORTag(24, dumps(self.script, default=default_encoder))
 
     @classmethod
     def from_primitive(
         cls: Type[_ScriptRef], value: List[Primitive], type_args: Optional[tuple] = None
     ) -> _ScriptRef:
         assert isinstance(value, CBORTag)
-        return cls(_Script.from_primitive(cbor2.loads(value.value)))
+        return cls(_Script.from_primitive(loads(value.value)))
 
 
 @dataclass(repr=False)

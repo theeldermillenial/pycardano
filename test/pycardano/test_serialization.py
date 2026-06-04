@@ -54,7 +54,9 @@ from pycardano.serialization import (
     OrderedSet,
     RawCBOR,
     default_encoder,
+    dumps,
     limit_primitive_type,
+    loads,
 )
 
 
@@ -1075,11 +1077,13 @@ def test_ordered_set_as_key_in_dict():
 
 
 def test_indefinite_list_highjacking_does_not_break_cbor2():
+    # cbor2 6.x no longer lets us monkeypatch the global decoder, so indefinite-length
+    # framing is preserved per-call through pycardano's loads/dumps wrappers (array_hook).
     ls = IndefiniteFrozenList(["hello"])
     ls.freeze()
     a = {ls: 1}
-    encoded = cbor2.dumps(a, default=default_encoder)
-    decoded = cbor2.loads(encoded)
+    encoded = dumps(a, default=default_encoder)
+    decoded = loads(encoded)
     assert isinstance(list(decoded.keys())[0], IndefiniteList)
 
 
@@ -1093,12 +1097,13 @@ def test_definite_list_highjacking_does_not_break_cbor2():
 
 
 def test_indefinite_list_highjacking_does_not_break_cbor2_datum():
+    # Same as above, but the indefinite list is nested inside a CBORTag value.
     ls = IndefiniteFrozenList(["hello"])
     ls.freeze()
     datum = CBORTag(251, ls)
     a = {datum: 1}
-    encoded = cbor2.dumps(a, default=default_encoder)
-    decoded = cbor2.loads(encoded)
+    encoded = dumps(a, default=default_encoder)
+    decoded = loads(encoded)
     assert isinstance(list(decoded.keys())[0], CBORTag)
     assert isinstance(list(decoded.keys())[0].value, IndefiniteList)
 
