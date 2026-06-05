@@ -683,6 +683,35 @@ def test_ordered_set_with_complex_types():
     assert restored == witness_set
 
 
+def test_ordered_set_dedup_unhashable_and_mixed():
+    # Unhashable elements (e.g. plain dicts) de-duplicate via their CBOR bytes — the
+    # fallback path for the native-hash de-dup key.
+    s = OrderedSet([{"a": 1}, {"a": 1}, {"b": 2}])
+    assert len(list(s)) == 2
+    assert {"a": 1} in s
+    assert {"c": 3} not in s
+
+    # Mixing hashable and unhashable elements must not produce false collisions.
+    mixed = OrderedSet([1, {"a": 1}, 1, {"a": 1}])
+    assert len(list(mixed)) == 2
+    assert 1 in mixed and {"a": 1} in mixed
+
+    # remove() works on the unhashable (CBOR-keyed) path and preserves order.
+    s.remove({"a": 1})
+    assert list(s) == [{"b": 2}]
+
+
+def test_restore_typed_primitive_direct():
+    from pycardano.serialization import _restore_typed_primitive
+
+    # Direct entry point: a primitive value passes straight through.
+    assert _restore_typed_primitive(int, 5) == 5
+    # ByteString: a raw bytes value is wrapped; an already-ByteString value passes through.
+    bs = ByteString(b"hello")
+    assert _restore_typed_primitive(ByteString, b"hello") == bs
+    assert _restore_typed_primitive(ByteString, bs) is bs
+
+
 def test_non_empty_ordered_set():
     # Test basic functionality
     s = NonEmptyOrderedSet([1, 2, 3])

@@ -23,7 +23,6 @@ from pycardano.backend.base import (
     GenesisParameters,
     ProtocolParameters,
 )
-from pycardano.cbor import cbor2
 from pycardano.exception import (
     CardanoCliError,
     PyCardanoException,
@@ -405,14 +404,10 @@ class CardanoCliChainContext(ChainContext):
         script_type = reference_script["script"]["type"]
         script_json: JsonDict = reference_script["script"]
         if script_type == "PlutusScriptV1":
-            v1script = PlutusV1Script(
-                loads(bytes.fromhex(script_json["cborHex"]))
-            )
+            v1script = PlutusV1Script(loads(bytes.fromhex(script_json["cborHex"])))
             return v1script
         elif script_type == "PlutusScriptV2":
-            v2script = PlutusV2Script(
-                loads(bytes.fromhex(script_json["cborHex"]))
-            )
+            v2script = PlutusV2Script(loads(bytes.fromhex(script_json["cborHex"])))
             return v2script
         else:
             return NativeScript.from_dict(script_json)

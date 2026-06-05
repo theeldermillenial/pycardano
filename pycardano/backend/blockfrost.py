@@ -15,7 +15,6 @@ from pycardano.backend.base import (
     GenesisParameters,
     ProtocolParameters,
 )
-from pycardano.cbor import cbor2
 from pycardano.exception import TransactionFailedException
 from pycardano.hash import SCRIPT_HASH_SIZE, DatumHash, ScriptHash
 from pycardano.nativescript import NativeScript
