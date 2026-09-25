@@ -14,7 +14,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
 
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +41,31 @@ jobs:
         if: ${{ matrix.python-version == '3.13' }}
         run: |
           make qa
+
+  build-cbor2-array-hook:
+    # The unit tests again on the cbor2 fork that provides ``array_hook``, so the
+    # decoder it enables is exercised as well as the stock-cbor2 fallback above.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'poetry'
+      - name: Install dependencies
+        run: |
+          poetry install
+          poetry run pip install "cbor2 @ git+https://github.com/theeldermillenial/cbor2.git@6.1.4.post1"
+      - name: Check the array_hook decoder is active
+        run: |
+          poetry run python -c "import pycardano.serialization as s; assert s.loads is s._loads_array_hook"
+      - name: Run unit tests
+        run: |
+          poetry run pytest --doctest-modules --ignore=examples
 
   continuous-integration:
     runs-on: ${{ matrix.os }}

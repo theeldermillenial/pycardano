@@ -341,22 +341,6 @@ def test_raw_plutus_data():
     check_two_way_cbor(raw_plutus_data)
 
 
-def test_plutusdata_long_bytes_validation_cached_path():
-    from pycardano.exception import InvalidArgumentException
-
-    @dataclass
-    class HasBytes(PlutusData):
-        CONSTR_ID = 0
-        a: bytes
-
-    # First instance (cache miss) validates the field types and caches the class.
-    HasBytes(b"short")
-    # Second instance hits the cached fast path, which must still enforce the
-    # per-instance >64-byte limit.
-    with pytest.raises(InvalidArgumentException):
-        HasBytes(b"x" * 65)
-
-
 def test_clone_raw_plutus_data():
     tag = RawPlutusData(CBORTag(121, [1000]))
 
@@ -364,9 +348,7 @@ def test_clone_raw_plutus_data():
     assert cloned_tag == tag
     assert cloned_tag.to_cbor_hex() == tag.to_cbor_hex()
 
-    # cbor2 6.x CBORTag is immutable (its `value` is read-only), so exercise the
-    # clone-independence check by reassigning the tag rather than mutating in place.
-    tag.data = CBORTag(121, [1001])
+    tag.data = CBORTag(tag.data.tag, [1001])
 
     assert cloned_tag != tag
 

@@ -8,7 +8,7 @@ import re
 import typing
 from collections import OrderedDict, UserList, defaultdict
 from copy import deepcopy
-from dataclasses import Field, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
 from fractions import Fraction
@@ -64,6 +64,11 @@ __all__ = [
 
 T = TypeVar("T")
 
+# Scalar leaf types that (de)serialize to themselves — the large majority of nodes
+# in a typical tree. A single membership test replaces an ``isinstance`` cascade on
+# the hot path. ``type(None)`` covers ``None``.
+_SCALAR_TYPES = frozenset({int, str, bytes, bool, float, type(None)})
+
 
 def _identity(x):
     return x
@@ -71,7 +76,10 @@ def _identity(x):
 
 class IndefiniteList(UserList):
     def __init__(self, li: Primitive):  # type: ignore
-        super().__init__(li)  # type: ignore
+        if isinstance(li, FrozenList):
+            super().__init__(list(li))  # type: ignore
+        else:
+            super().__init__(li)  # type: ignore
 
 
 class IndefiniteFrozenList(FrozenList, IndefiniteList):  # type: ignore
@@ -231,7 +239,25 @@ ENCODERS = {IndefiniteList: _enc_indef, IndefiniteFrozenList: _enc_indef}
 _KEEP_258 = {258: lambda item, immutable: CBORTag(258, item)}
 
 
-def loads(payload, **kw):
+def _cbor2_has_array_hook() -> bool:
+    try:
+        # array_hook is not in stock cbor2's signature; this probe detects a build
+        # that provides it.
+        cbor2.loads(b"\x80", array_hook=_array_hook)  # type: ignore[call-arg, unused-ignore]
+    except TypeError:
+        return False
+    return True
+
+
+_HAS_ARRAY_HOOK = _cbor2_has_array_hook()
+
+
+def _loads_array_hook(payload, **kw):
+    """Decode CBOR, keeping indefinite-length arrays as :class:`IndefiniteFrozenList`.
+
+    cbor2's ``array_hook`` reports each array's framing as it is decoded, so the
+    definite/indefinite distinction needs no second pass over the payload.
+    """
     return cbor2.loads(
         payload, array_hook=_array_hook, semantic_decoders=_KEEP_258, **kw
     )
@@ -262,9 +288,8 @@ def default_encoder(
         f"Type of input value is not CBORSerializable, " f"got {type(value)} instead."
     )
     if isinstance(value, (IndefiniteList, IndefiniteFrozenList)):
-        # Currently, cbor2 doesn't support indefinite list, therefore we need special
-        # handling here to explicitly write header (b'\x9f'), each body item, and footer (b'\xff') to
-        # the output bytestring.
+        # Indefinite containers are selected globally by cbor2, so explicitly write
+        # this container to preserve PyCardano's per-list representation.
         encoder.write(b"\x9f")
         # Iterate the underlying list for a plain IndefiniteList (UserList) to avoid the
         # slow Sequence.__iter__; IndefiniteFrozenList has no usable .data, so use identity.
@@ -290,6 +315,132 @@ def default_encoder(
         encoder.encode(dict(value))
     else:
         encoder.encode(value.to_validated_primitive())
+
+
+def _decode_ordered_set(value: Any, immutable: bool) -> CBORTag:
+    return CBORTag(258, value)
+
+
+@dataclass(frozen=True)
+class _CBORShape:
+    major_type: int
+    indefinite: bool = False
+    children: tuple = ()
+
+
+def _read_argument(payload: memoryview, offset: int, subtype: int) -> tuple[int, int]:
+    if subtype < 24:
+        return subtype, offset
+
+    length = 1 << (subtype - 24)
+    return int.from_bytes(payload[offset : offset + length], "big"), offset + length
+
+
+def _scan_cbor(payload: memoryview, offset: int = 0) -> tuple[_CBORShape, int]:
+    initial_byte = payload[offset]
+    offset += 1
+    major_type, subtype = divmod(initial_byte, 32)
+
+    if subtype == 31:
+        argument = None
+    else:
+        argument, offset = _read_argument(payload, offset, subtype)
+
+    if major_type in (0, 1, 7):
+        return _CBORShape(major_type), offset
+
+    if major_type in (2, 3):
+        if argument is None:
+            while payload[offset] != 0xFF:
+                _, offset = _scan_cbor(payload, offset)
+            return _CBORShape(major_type, indefinite=True), offset + 1
+
+        return _CBORShape(major_type), offset + argument
+
+    if major_type == 4:
+        array_children: List[_CBORShape] = []
+        if argument is None:
+            while payload[offset] != 0xFF:
+                child, offset = _scan_cbor(payload, offset)
+                array_children.append(child)
+            offset += 1
+        else:
+            for _ in range(argument):
+                child, offset = _scan_cbor(payload, offset)
+                array_children.append(child)
+
+        return _CBORShape(major_type, argument is None, tuple(array_children)), offset
+
+    if major_type == 5:
+        map_children: List[tuple[_CBORShape, _CBORShape]] = []
+        if argument is None:
+            while payload[offset] != 0xFF:
+                key, offset = _scan_cbor(payload, offset)
+                item, offset = _scan_cbor(payload, offset)
+                map_children.append((key, item))
+            offset += 1
+        else:
+            for _ in range(argument):
+                key, offset = _scan_cbor(payload, offset)
+                item, offset = _scan_cbor(payload, offset)
+                map_children.append((key, item))
+
+        return _CBORShape(major_type, argument is None, tuple(map_children)), offset
+
+    child, offset = _scan_cbor(payload, offset)
+    return _CBORShape(major_type, children=(child,)), offset
+
+
+def _apply_cbor_shape(value: Any, shape: _CBORShape, immutable: bool = False) -> Any:
+    if shape.major_type == 4:
+        array_items = [
+            _apply_cbor_shape(item, item_shape, immutable)
+            for item, item_shape in zip(value, shape.children)
+        ]
+        if shape.indefinite:
+            if immutable:
+                frozen_items = IndefiniteFrozenList(array_items)
+                frozen_items.freeze()
+                return frozen_items
+            return IndefiniteList(array_items)
+
+        return tuple(array_items) if immutable else array_items
+
+    if shape.major_type == 5:
+        paired_items = zip(value.items(), shape.children)
+        mapped_items = {
+            _apply_cbor_shape(key, key_shape, immutable=True): _apply_cbor_shape(
+                item, item_shape, immutable
+            )
+            for (key, item), (key_shape, item_shape) in paired_items
+        }
+        return FrozenDict(mapped_items) if immutable else mapped_items
+
+    if shape.major_type == 6 and isinstance(value, CBORTag):
+        child = _apply_cbor_shape(value.value, shape.children[0], immutable)
+        return CBORTag(value.tag, child)
+
+    return value
+
+
+def _loads_shape_scan(payload: bytes, **kwargs: Any) -> Any:
+    """Decode CBOR while preserving order and indefinite-length arrays.
+
+    Fallback for a cbor2 without ``array_hook``: decode, then re-scan the payload
+    to recover which arrays were indefinite-length.
+    """
+    semantic_decoders = dict(kwargs.pop("semantic_decoders", {}))
+    semantic_decoders.setdefault(258, _decode_ordered_set)
+    value = cbor2.loads(payload, semantic_decoders=semantic_decoders, **kwargs)
+    shape, offset = _scan_cbor(memoryview(payload))
+    assert offset == len(payload)
+    return _apply_cbor_shape(value, shape)
+
+
+# Decode CBOR while keeping indefinite-length arrays distinguishable from definite
+# ones: cbor2's ``array_hook`` when the installed cbor2 provides it, otherwise the
+# shape-scan fallback. Chosen once here so each call dispatches directly.
+loads = _loads_array_hook if _HAS_ARRAY_HOOK else _loads_shape_scan
 
 
 @typechecked
@@ -355,14 +506,7 @@ class CBORSerializable:
             tv = type(value)
             # Fast path for scalar leaves (the large majority of nodes), skipping the
             # isinstance cascade below.
-            if (
-                tv is int
-                or tv is str
-                or tv is bytes
-                or tv is bool
-                or tv is float
-                or value is None
-            ):
+            if tv in _SCALAR_TYPES:
                 return value
             if isinstance(value, CBORSerializable):
                 # Preserve polymorphic dispatch: subclasses that override
@@ -738,24 +882,6 @@ class CBORSerializable:
             return cls.from_json(f.read())
 
 
-def _restore_dataclass_field(
-    f: Field, v: Primitive
-) -> Union[Primitive, CBORSerializable]:
-    """Try to restore a value back to its original type based on information given in field.
-
-    Args:
-        f (dataclass_field): A data class field.
-        v (:const:`Primitive`): A CBOR primitive.
-
-    Returns:
-        Union[:const:`Primitive`, CBORSerializable]: A CBOR primitive or a CBORSerializable.
-    """
-
-    if "object_hook" in f.metadata:
-        return f.metadata["object_hook"](v)
-    return _restore_typed_primitive(cast(Any, f.type), v)
-
-
 # Resolving type hints and introspecting from_primitive signatures is expensive and
 # is otherwise repeated on every (de)serialization. Both depend only on the class, so
 # cache them. WeakKeyDictionary lets dynamically-created classes be garbage collected.
@@ -1069,7 +1195,7 @@ def _array_field_plan(
         return plan
     type_hints = _cached_type_hints(cls)
     plan = []
-    for f in fields(cls):
+    for f in _cached_fields(cls):
         if not f.init:
             continue
         # Preserve the original lazy resolution of the (possibly string) annotation to a
@@ -1104,7 +1230,7 @@ def _map_field_plan(
         return plan
     type_hints = _cached_type_hints(cls)
     plan = {}
-    for f in fields(cls):
+    for f in _cached_fields(cls):
         if not f.init:  # pragma: no cover - map serializable fields are init fields
             continue
         key = f.metadata.get("key", f.name)
