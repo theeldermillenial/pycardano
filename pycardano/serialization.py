@@ -241,7 +241,9 @@ _KEEP_258 = {258: lambda item, immutable: CBORTag(258, item)}
 
 def _cbor2_has_array_hook() -> bool:
     try:
-        cbor2.loads(b"\x80", array_hook=_array_hook)
+        # array_hook is not in stock cbor2's signature; this probe detects a build
+        # that provides it.
+        cbor2.loads(b"\x80", array_hook=_array_hook)  # type: ignore[call-arg, unused-ignore]
     except TypeError:
         return False
     return True
