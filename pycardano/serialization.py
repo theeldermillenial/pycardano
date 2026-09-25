@@ -250,15 +250,12 @@ def _cbor2_has_array_hook() -> bool:
 _HAS_ARRAY_HOOK = _cbor2_has_array_hook()
 
 
-def loads(payload, **kw):
+def _loads_array_hook(payload, **kw):
     """Decode CBOR, keeping indefinite-length arrays as :class:`IndefiniteFrozenList`.
 
-    Uses cbor2's ``array_hook`` when available, so the definite/indefinite
-    distinction is captured in the decoder itself; otherwise falls back to
-    :func:`_loads_shape_scan`.
+    cbor2's ``array_hook`` reports each array's framing as it is decoded, so the
+    definite/indefinite distinction needs no second pass over the payload.
     """
-    if not _HAS_ARRAY_HOOK:
-        return _loads_shape_scan(payload, **kw)
     return cbor2.loads(
         payload, array_hook=_array_hook, semantic_decoders=_KEEP_258, **kw
     )
@@ -436,6 +433,12 @@ def _loads_shape_scan(payload: bytes, **kwargs: Any) -> Any:
     shape, offset = _scan_cbor(memoryview(payload))
     assert offset == len(payload)
     return _apply_cbor_shape(value, shape)
+
+
+# Decode CBOR while keeping indefinite-length arrays distinguishable from definite
+# ones: cbor2's ``array_hook`` when the installed cbor2 provides it, otherwise the
+# shape-scan fallback. Chosen once here so each call dispatches directly.
+loads = _loads_array_hook if _HAS_ARRAY_HOOK else _loads_shape_scan
 
 
 @typechecked
