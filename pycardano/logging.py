@@ -24,16 +24,20 @@ def log_state(func):
     """Decorator to log the state of an object after its function call."""
 
     def wrapper(obj, *args, **kwargs):
+        # The state dump can be very large (every input UTxO, every output), so only
+        # format it when the record would actually be emitted.
         try:
             output = func(obj, *args, **kwargs)
-            logger.debug(
-                f"Class: {obj.__class__}, method: {func}, state:\n {pformat(vars(obj), indent=2)}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Class: {obj.__class__}, method: {func}, state:\n {pformat(vars(obj), indent=2)}"
+                )
             return output
         except Exception as e:
-            logger.warning(
-                f"Class: {obj.__class__}, method: {func}, state:\n {pformat(vars(obj), indent=2)}"
-            )
+            if logger.isEnabledFor(logging.WARNING):
+                logger.warning(
+                    f"Class: {obj.__class__}, method: {func}, state:\n {pformat(vars(obj), indent=2)}"
+                )
             raise e
 
     return wrapper

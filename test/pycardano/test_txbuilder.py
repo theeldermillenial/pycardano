@@ -1,5 +1,7 @@
 import copy
 import logging
+import random
+from contextlib import nullcontext
 from dataclasses import replace
 from fractions import Fraction
 from test.pycardano.test_key import SK
@@ -9,6 +11,7 @@ from unittest.mock import patch
 import pytest
 from cbor2 import CBORTag
 from frozenlist import FrozenList
+from typeguard import TypeCheckError
 
 from pycardano import (
     AssetName,
@@ -17,7 +20,7 @@ from pycardano import (
     RedeemerValue,
     min_lovelace_post_alonzo,
 )
-from pycardano.address import Address
+from pycardano.address import Address, PointerAddress
 from pycardano.certificate import (
     PoolRegistration,
     StakeCredential,
@@ -28,7 +31,9 @@ from pycardano.coinselection import RandomImproveMultiAsset
 from pycardano.exception import (
     InsufficientUTxOBalanceException,
     InvalidArgumentException,
+    InvalidDataException,
     InvalidTransactionException,
+    TransactionBuilderException,
     UTxOSelectionException,
 )
 from pycardano.hash import (
@@ -60,6 +65,7 @@ from pycardano.plutus import (
     script_hash,
 )
 from pycardano.transaction import (
+    Asset,
     MultiAsset,
     TransactionInput,
     TransactionOutput,
@@ -67,7 +73,7 @@ from pycardano.transaction import (
     Value,
     Withdrawals,
 )
-from pycardano.txbuilder import TransactionBuilder
+from pycardano.txbuilder import FAKE_VKEY, TransactionBuilder
 from pycardano.utils import fee
 from pycardano.witness import TransactionWitnessSet, VerificationKeyWitness
 
@@ -3240,3 +3246,505 @@ def test_inline_datum_error(chain_context):
         tx_builder.add_script_input(utxo, plutus_script, different_datum, redeemer)
 
     assert "Inline Datum found" in str(exc_info.value)
+
+
+def _random_multi_asset(rng, max_policies, max_assets, allow_zero=False):
+    quantities = [1, 23, 24, 255, 256, 65535, 65536, 2**32 - 1, 2**32, 2**64 - 1]
+    multi_asset = MultiAsset()
+    for _ in range(rng.randint(1, max_policies)):
+        asset = Asset()
+        for _ in range(rng.randint(1, max_assets)):
+            name_size = rng.choice([0, 1, 4, 23, 24, 32])
+            quantity = rng.choice(quantities)
+            if allow_zero and rng.random() < 0.1:
+                quantity = 0
+            elif allow_zero and rng.random() < 0.2:
+                quantity = -quantity
+            asset[AssetName(rng.randbytes(name_size))] = quantity
+        multi_asset[ScriptHash(rng.randbytes(28))] = asset
+    return multi_asset
+
+
+def _ordered(multi_asset):
+    return [
+        (policy_id.payload, [(name.payload, q) for name, q in assets.data.items()])
+        for policy_id, assets in multi_asset.data.items()
+    ]
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_sum_values_matches_repeated_add(seed):
+    from pycardano.txbuilder import _sum_values
+
+    rng = random.Random(seed)
+    values = [
+        Value(rng.randint(0, 10**9), _random_multi_asset(rng, 5, 5, allow_zero=True))
+        for _ in range(rng.randint(0, 20))
+    ]
+    # Reuse keys across values so that quantities collide, cancel out and come back.
+    keys = [
+        (p, n) for v in values for p, a in v.multi_asset.data.items() for n in a.data
+    ]
+    for value in values:
+        for _ in range(rng.randint(0, 4)):
+            if keys:
+                policy_id, name = rng.choice(keys)
+                value.multi_asset.data.setdefault(policy_id, Asset())[name] = (
+                    rng.choice([-5, -1, 0, 1, 5])
+                )
+    for _ in range(rng.randint(0, 3)):
+        values.insert(rng.randint(0, len(values)), rng.randint(0, 10**6))
+    originals = copy.deepcopy(values)
+
+    expected = Value()
+    for value in values:
+        expected += value
+    result = _sum_values(values)
+
+    assert result == expected
+    assert _ordered(result.multi_asset) == _ordered(expected.multi_asset)
+    assert result.to_cbor() == expected.to_cbor()
+    assert values == originals
+
+    if values:
+        start = Value() + values[0]
+        expected = copy.deepcopy(start)
+        for value in values[1:]:
+            expected += value
+        result = _sum_values(values[1:], start=start)
+        assert result == expected
+        assert _ordered(result.multi_asset) == _ordered(expected.multi_asset)
+        assert start == Value() + values[0]
+
+
+def test_sum_values_unnormalized_start_matches_add():
+    from pycardano.txbuilder import _sum_values
+
+    p1, p2, p3 = (ScriptHash(bytes([i]) * 28) for i in range(3))
+    a, b, c, d = (AssetName(n) for n in (b"a", b"b", b"c", b"d"))
+    start = Value(
+        5,
+        MultiAsset(
+            {
+                p1: Asset({a: 0, b: 3}),
+                p2: Asset(),
+                p3: Asset({c: 0}),
+            }
+        ),
+    )
+    original = _ordered(start.multi_asset)
+    touch_a = Value(0, MultiAsset({p1: Asset({a: 1})}))
+    touch_p2 = Value(0, MultiAsset({p2: Asset({d: 1})}))
+    other = Value(1, MultiAsset({p3: Asset({c: 1})}))
+
+    for values in ([], [touch_a], [other, touch_a], [touch_p2, other]):
+        expected = start + (values[0] if values else 0)
+        for value in values[1:]:
+            expected += value
+        result = _sum_values(values, start=start)
+
+        assert result == expected
+        assert _ordered(result.multi_asset) == _ordered(expected.multi_asset)
+        assert result.to_cbor() == expected.to_cbor()
+        assert _ordered(start.multi_asset) == original
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("max_val_size", [40, 60, 120, 300, 1000, 5000])
+@pytest.mark.parametrize("coins_per_utxo_byte", [1, 7, 4310, 1_000_000])
+def test_pack_tokens_for_change_by_size_matches_serialization(
+    chain_context, seed, max_val_size, coins_per_utxo_byte
+):
+    chain_context.protocol_param = replace(
+        chain_context.protocol_param, coins_per_utxo_byte=coins_per_utxo_byte
+    )
+    rng = random.Random(f"{seed}/{max_val_size}/{coins_per_utxo_byte}")
+    tx_builder = TransactionBuilder(chain_context)
+    byron = "DdzFFzCqrhsxrgB6w6VhgfAqUZ69Va583murc21S4QFTJ6WUHAh4Gk8t1QHofpza5MZxG4dNVQWe8q78h4Utp9MGBQHBLD54rz6CTLsm"
+    address = rng.choice(
+        [
+            None,
+            Address.from_primitive(
+                "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+            ),
+            Address(
+                VerificationKeyHash(rng.randbytes(28)),
+                VerificationKeyHash(rng.randbytes(28)),
+            ),
+            Address(ScriptHash(rng.randbytes(28))),
+            Address(
+                VerificationKeyHash(rng.randbytes(28)),
+                PointerAddress(
+                    rng.randint(0, 2**40), rng.randint(0, 2**16), rng.randint(0, 9)
+                ),
+            ),
+            Address.from_primitive(
+                "Ae2tdPwUPEZFRbyhz3cpfC2CumGzNkFBN2L42rcUc2yjQpEkxDbkPodpMAi"
+            ),
+            Address.from_primitive(byron),
+        ]
+    )
+    change = Value(
+        rng.choice(
+            [0, 1, 23, 24, 65535, 65536, 1_000_000, 2**32, 45 * 10**15, 2**64 - 1]
+        ),
+        _random_multi_asset(rng, rng.choice([1, 3, 10, 40]), rng.choice([1, 5, 30])),
+    )
+
+    expected = tx_builder._pack_tokens_for_change_by_serialization(
+        address, copy.deepcopy(change), max_val_size
+    )
+    result = tx_builder._pack_tokens_for_change_by_size(
+        address, copy.deepcopy(change), max_val_size
+    )
+
+    assert result is not None
+    assert [_ordered(m) for m in result] == [_ordered(m) for m in expected]
+
+
+@pytest.mark.parametrize(
+    "coin, shape",
+    [
+        (0, [1]),
+        (0, [2]),
+        (1, [1, 1]),
+        (1, [2, 1]),
+        (2**64 - 1, [1, 2]),
+        (1, [1] * 24),
+        (1, [24]),
+        (1, [23, 2]),
+    ],
+)
+def test_pack_tokens_for_change_by_size_matches_serialization_at_width_boundaries(
+    chain_context, coin, shape
+):
+    # Only the width of an output's required lovelace enters its value size, so the
+    # size model is exercised byte for byte where that lovelace sits next to a CBOR
+    # integer width boundary: coins_per_utxo_byte is chosen to put the required
+    # lovelace of each output the change can be split into just below and just at
+    # 2**16, and that of the whole change also at 2**32. ``shape`` holds the number
+    # of assets of each policy; 24 policies or assets take a two-byte count head.
+    rng = random.Random(f"{coin}/{shape}")
+    multi_asset = MultiAsset()
+    for num_assets in shape:
+        assets = Asset()
+        while len(assets) < num_assets:
+            name = AssetName(rng.randbytes(rng.choice([0, 1, 4])))
+            assets[name] = rng.choice([1, 24, 256, 2**32])
+        multi_asset[ScriptHash(rng.randbytes(28))] = assets
+    change = Value(coin, multi_asset)
+    entries = [
+        (policy_id, name, quantity)
+        for policy_id, assets in multi_asset.data.items()
+        for name, quantity in assets.data.items()
+    ]
+
+    # Each output holds a contiguous run of the assets; only the first one holds the
+    # change's coin, and an output holding 0 lovelace is priced as holding 1 ADA.
+    if len(entries) <= 4:
+        runs = [
+            (start, end)
+            for start in range(len(entries))
+            for end in range(start + 1, len(entries) + 1)
+        ]
+    else:
+        runs = [(0, len(entries))]
+    coins_per_utxo_bytes = set()
+    for start, end in runs:
+        run = MultiAsset()
+        for policy_id, name, quantity in entries[start:end]:
+            run.data.setdefault(policy_id, Asset())[name] = quantity
+        priced_coin = coin if start == 0 and coin != 0 else 1_000_000
+        charged_size = 160 + len(
+            TransactionOutput(
+                Address(FAKE_VKEY.hash()), Value(priced_coin, run), post_alonzo=True
+            ).to_cbor()
+        )
+        for width_boundary in (
+            [2**16, 2**32] if end - start == len(entries) else [2**16]
+        ):
+            coins_per_utxo_bytes.add((width_boundary - 1) // charged_size)
+            coins_per_utxo_bytes.add(-(-width_boundary // charged_size))
+
+    full_size = len(Value(2**64 - 1, multi_asset).to_cbor())
+    if len(entries) <= 4:
+        max_val_sizes = range(1, full_size + 1)
+    else:
+        max_val_sizes = range(full_size - 8, full_size + 1)
+    tx_builder = TransactionBuilder(chain_context)
+    for coins_per_utxo_byte in sorted(coins_per_utxo_bytes):
+        chain_context.protocol_param = replace(
+            chain_context.protocol_param, coins_per_utxo_byte=coins_per_utxo_byte
+        )
+        for max_val_size in max_val_sizes:
+            expected = tx_builder._pack_tokens_for_change_by_serialization(
+                None, copy.deepcopy(change), max_val_size
+            )
+            result = tx_builder._pack_tokens_for_change_by_size(
+                None, copy.deepcopy(change), max_val_size
+            )
+
+            assert result is not None
+            assert [_ordered(m) for m in result] == [_ordered(m) for m in expected]
+
+
+def test_pack_tokens_for_change_by_size_prices_zero_coin_as_one_ada(chain_context):
+    chain_context.protocol_param = replace(
+        chain_context.protocol_param, coins_per_utxo_byte=280
+    )
+    tx_builder = TransactionBuilder(chain_context)
+    multi_asset = MultiAsset({ScriptHash(b"1" * 28): Asset({AssetName(b"a"): 1})})
+    address = Address(FAKE_VKEY.hash())
+    # Priced at 1 ADA, the output's required lovelace takes a 5-byte head and its
+    # value no longer fits in 40 bytes; priced at its 0 lovelace, it would.
+    for priced_coin, charged_size, value_size in [(1_000_000, 235, 41), (0, 231, 39)]:
+        output = TransactionOutput(
+            address, Value(priced_coin, multi_asset), post_alonzo=True
+        )
+        assert 160 + len(output.to_cbor()) == charged_size
+        required_lovelace = charged_size * 280
+        assert len(Value(required_lovelace, multi_asset).to_cbor()) == value_size
+
+    change = Value(0, multi_asset)
+    expected = tx_builder._pack_tokens_for_change_by_serialization(
+        None, copy.deepcopy(change), 40
+    )
+    result = tx_builder._pack_tokens_for_change_by_size(None, copy.deepcopy(change), 40)
+
+    assert expected != [multi_asset]
+    assert result == expected
+
+
+def test_pack_tokens_for_change_by_size_declines_unmodelled_change(chain_context):
+    class PaddedAssetName(AssetName):
+        def to_primitive(self):
+            return self.payload + b"pad"
+
+    class PaddedScriptHash(ScriptHash):
+        def to_primitive(self):
+            return self.payload + b"pad"
+
+    tx_builder = TransactionBuilder(chain_context)
+    policy_id = ScriptHash(b"1" * 28)
+    for change in [
+        Value(1, MultiAsset({policy_id: Asset({AssetName(b"a"): 2**64})})),
+        Value(2**64, MultiAsset({policy_id: Asset({AssetName(b"a"): 1})})),
+        Value(1, MultiAsset({policy_id: Asset()})),
+        Value(
+            1, MultiAsset({policy_id: Asset({AssetName(b"a"): 0, AssetName(b"b"): 1})})
+        ),
+        Value(
+            1,
+            MultiAsset(
+                {policy_id: Asset({PaddedAssetName(b"a"): 1, AssetName(b"b"): 1})}
+            ),
+        ),
+        Value(
+            1, MultiAsset({PaddedScriptHash(b"2" * 28): Asset({AssetName(b"a"): 1})})
+        ),
+    ]:
+        assert tx_builder._pack_tokens_for_change_by_size(None, change, 5000) is None
+        # The public entry point still packs it, through the serializing path.
+        assert tx_builder._pack_tokens_for_change(
+            None, change, 5000
+        ) == tx_builder._pack_tokens_for_change_by_serialization(None, change, 5000)
+    for change in [
+        Value(1, MultiAsset({policy_id: Asset({AssetName(b"a"): -1})})),
+        Value(-1, MultiAsset({policy_id: Asset({AssetName(b"a"): 1})})),
+    ]:
+        assert tx_builder._pack_tokens_for_change_by_size(None, change, 5000) is None
+        # The serializing path rejects a negative amount when it validates the output.
+        with pytest.raises(InvalidDataException):
+            tx_builder._pack_tokens_for_change(None, change, 5000)
+    for change, error in [
+        (Value(1.5, MultiAsset({policy_id: Asset({AssetName(b"a"): 1})})), TypeError),
+        (
+            Value(1, MultiAsset({policy_id: Asset({AssetName(b"a"): 1.5})})),
+            TypeCheckError,
+        ),
+    ]:
+        assert tx_builder._pack_tokens_for_change_by_size(None, change, 5000) is None
+        with pytest.raises(error):
+            tx_builder._pack_tokens_for_change(None, change, 5000)
+
+    # A required lovelace beyond 64 bits encodes as a bignum.
+    change = Value(0, MultiAsset({policy_id: Asset({AssetName(b"a"): 1})}))
+    # Bytes the required lovelace of ``change`` is charged for; an output holding 0
+    # lovelace is priced as holding 1 ADA.
+    priced = Value(1_000_000, change.multi_asset)
+    charged_size = 160 + len(
+        TransactionOutput(Address(FAKE_VKEY.hash()), priced, post_alonzo=True).to_cbor()
+    )
+    for coins_per_utxo_byte, declined in [
+        (2**60, True),
+        (-(-(2**64) // charged_size), True),
+        ((2**64 - 1) // charged_size, False),
+    ]:
+        chain_context.protocol_param = replace(
+            chain_context.protocol_param, coins_per_utxo_byte=coins_per_utxo_byte
+        )
+        packed = tx_builder._pack_tokens_for_change_by_size(None, change, 5000)
+        expected = tx_builder._pack_tokens_for_change_by_serialization(
+            None, change, 5000
+        )
+        assert (packed is None) == declined
+        assert tx_builder._pack_tokens_for_change(None, change, 5000) == expected
+        if not declined:
+            assert packed == expected
+
+
+def test_build_sets_spend_redeemer_indexes_in_input_order(chain_context):
+    tx_builder = TransactionBuilder(chain_context)
+    plutus_script = PlutusV1Script(b"dummy test script")
+    script_address = Address(plutus_script_hash(plutus_script))
+    datum = PlutusData()
+    redeemers = {}
+    # Added in the reverse of their order in the transaction, which sorts its inputs.
+    for tx_id in ["ff" * 32, "11" * 32]:
+        utxo = UTxO(
+            TransactionInput.from_primitive([tx_id, 0]),
+            TransactionOutput(script_address, 10000000, datum_hash=datum.hash()),
+        )
+        redeemers[tx_id] = Redeemer(PlutusData(), ExecutionUnits(1000000, 1000000))
+        tx_builder.add_script_input(utxo, plutus_script, datum, redeemers[tx_id])
+    receiver = Address.from_primitive(
+        "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+    )
+    tx_builder.add_output(TransactionOutput(receiver, 5000000))
+    tx_body = tx_builder.build(change_address=receiver)
+
+    assert [i.transaction_id.payload.hex() for i in tx_body.inputs] == [
+        "11" * 32,
+        "ff" * 32,
+    ]
+    assert redeemers["11" * 32].index == 0
+    assert redeemers["ff" * 32].index == 1
+
+
+def test_build_rejects_input_also_excluded(chain_context):
+    sender = "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+    utxo = chain_context.utxos(sender)[0]
+    tx_builder = TransactionBuilder(chain_context)
+    tx_builder.add_input(utxo).add_output(
+        TransactionOutput.from_primitive([sender, 500000])
+    )
+    tx_builder.excluded_inputs.append(utxo)
+
+    with pytest.raises(TransactionBuilderException, match="Found common UTxOs"):
+        tx_builder.build(change_address=Address.from_primitive(sender))
+
+
+@pytest.mark.parametrize("override", ["subclass", "class", "instance"])
+def test_estimate_fee_uses_overridden_build_full_fake_tx(chain_context, override):
+    original = TransactionBuilder._build_full_fake_tx
+    built = []
+
+    def recording(builder):
+        tx = original(builder)
+        built.append(tx)
+        return tx
+
+    class RecordingBuilder(TransactionBuilder):
+        def _build_full_fake_tx(self):
+            return recording(self)
+
+    sender = "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+    if override == "subclass":
+        tx_builder = RecordingBuilder(chain_context)
+        overridden = nullcontext()
+    elif override == "class":
+        tx_builder = TransactionBuilder(chain_context)
+        overridden = patch.object(TransactionBuilder, "_build_full_fake_tx", recording)
+    else:
+        tx_builder = TransactionBuilder(chain_context)
+        overridden = patch.object(
+            tx_builder, "_build_full_fake_tx", lambda: recording(tx_builder)
+        )
+    tx_builder.add_input_address(sender).add_output(
+        TransactionOutput.from_primitive([sender, 500000])
+    )
+    with overridden:
+        tx_body = tx_builder.build(change_address=Address.from_primitive(sender))
+
+    assert built
+    assert tx_body.fee == fee(chain_context, len(built[-1].to_cbor()))
+
+
+@pytest.mark.parametrize("override", ["subclass", "class", "instance"])
+def test_pack_tokens_for_change_uses_overridden_overflow_check(chain_context, override):
+    original = TransactionBuilder._adding_asset_make_output_overflow
+    calls = []
+
+    def recording(builder, *args):
+        calls.append(args)
+        return original(builder, *args)
+
+    class RecordingBuilder(TransactionBuilder):
+        def _adding_asset_make_output_overflow(self, *args):
+            return recording(self, *args)
+
+    if override == "subclass":
+        tx_builder = RecordingBuilder(chain_context)
+        overridden = nullcontext()
+    elif override == "class":
+        tx_builder = TransactionBuilder(chain_context)
+        overridden = patch.object(
+            TransactionBuilder, "_adding_asset_make_output_overflow", recording
+        )
+    else:
+        tx_builder = TransactionBuilder(chain_context)
+        overridden = patch.object(
+            tx_builder,
+            "_adding_asset_make_output_overflow",
+            lambda *args: recording(tx_builder, *args),
+        )
+    policy_id = ScriptHash(b"1" * 28)
+    change = Value(
+        5_000_000,
+        MultiAsset({policy_id: Asset({AssetName(b"a"): 1, AssetName(b"b"): 2})}),
+    )
+    expected = TransactionBuilder(
+        chain_context
+    )._pack_tokens_for_change_by_serialization(None, copy.deepcopy(change), 41)
+    with overridden:
+        packed = tx_builder._pack_tokens_for_change(None, change, 41)
+
+    assert len(calls) == 2
+    assert packed == expected
+
+
+def test_pack_tokens_for_change_packs_by_size(chain_context):
+    tx_builder = TransactionBuilder(chain_context)
+    policy_id = ScriptHash(b"1" * 28)
+    change = Value(
+        5_000_000,
+        MultiAsset({policy_id: Asset({AssetName(b"a"): 1, AssetName(b"b"): 2})}),
+    )
+    expected = tx_builder._pack_tokens_for_change_by_serialization(
+        None, copy.deepcopy(change), 41
+    )
+    with patch.object(
+        TransactionBuilder,
+        "_pack_tokens_for_change_by_serialization",
+        side_effect=AssertionError("change packed by serialization"),
+    ):
+        assert tx_builder._pack_tokens_for_change(None, change, 41) == expected
+    assert len(expected) == 2
+
+
+def test_tx_builder_state_not_formatted_when_not_logged(chain_context, caplog):
+    tx_builder = TransactionBuilder(chain_context)
+    sender = "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+    tx_builder.add_input_address(sender).add_output(
+        TransactionOutput.from_primitive([sender, 500000])
+    )
+    pformat_patch = patch(
+        "pycardano.logging.pformat", side_effect=AssertionError("state formatted")
+    )
+    with caplog.at_level(logging.INFO), pformat_patch:
+        tx_builder.build(change_address=Address.from_primitive(sender))
+    with caplog.at_level(logging.ERROR), pformat_patch:
+        with pytest.raises(UTxOSelectionException):
+            TransactionBuilder(chain_context).add_input_address(sender).add_output(
+                TransactionOutput.from_primitive([sender, 10**15])
+            ).build(change_address=Address.from_primitive(sender))
