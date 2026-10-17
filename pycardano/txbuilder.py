@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from pycardano import RedeemerMap
 from pycardano.address import Address, AddressType
@@ -47,7 +47,13 @@ from pycardano.governance import (
     VotingProcedure,
     VotingProcedures,
 )
-from pycardano.hash import DatumHash, ScriptDataHash, ScriptHash, VerificationKeyHash
+from pycardano.hash import (
+    ConstrainedBytes,
+    DatumHash,
+    ScriptDataHash,
+    ScriptHash,
+    VerificationKeyHash,
+)
 from pycardano.key import ExtendedSigningKey, SigningKey, VerificationKey
 from pycardano.logging import log_state, logger
 from pycardano.metadata import AuxiliaryData
@@ -69,7 +75,7 @@ from pycardano.plutus import (
     datum_hash,
     script_hash,
 )
-from pycardano.serialization import NonEmptyOrderedSet, OrderedSet
+from pycardano.serialization import CBORSerializable, NonEmptyOrderedSet, OrderedSet
 from pycardano.transaction import (
     Asset,
     AssetName,
@@ -86,6 +92,91 @@ from pycardano.utils import fee, max_tx_fee, min_lovelace_post_alonzo, script_da
 from pycardano.witness import TransactionWitnessSet, VerificationKeyWitness
 
 __all__ = ["TransactionBuilder"]
+
+
+def _sum_values(
+    values: Iterable[Union[Value, int]], start: Optional[Value] = None
+) -> Value:
+    """Return ``start + values[0] + values[1] + ...`` (``start + 0`` when ``values``
+    is empty), with ``start`` defaulting to ``Value()``.
+
+    The result is equal to that chain of ``+`` -- same coin, same assets, same
+    policy and asset-name insertion order, zero quantities and empty policies
+    dropped as :meth:`MultiAsset.normalize` drops them -- but after the first
+    addition the running total is accumulated in place instead of being
+    deep-copied on every addition, so the cost is linear in the number of assets
+    added. Neither ``start`` nor ``values`` is modified.
+    """
+    to_add = iter(values)
+    if start is None:
+        total = Value()
+    else:
+        # ``+`` keeps the position of a key ``start`` already holds, even at a zero
+        # quantity, and then normalizes; the first addition uses it to match exactly.
+        total = start + next(to_add, 0)
+    acc = total.multi_asset.data
+    for value in to_add:
+        if isinstance(value, int):
+            total.coin += value
+            continue
+        total.coin += value.coin
+        for policy_id, assets in value.multi_asset.data.items():
+            policy_acc = acc.get(policy_id)
+            if policy_acc is None:
+                policy_acc = acc[policy_id] = Asset()
+            names = policy_acc.data
+            for name, quantity in assets.data.items():
+                new_quantity = names.get(name, 0) + quantity
+                if new_quantity == 0:
+                    names.pop(name, None)
+                else:
+                    names[name] = new_quantity
+            if not names:
+                del acc[policy_id]
+    return total
+
+
+def _cbor_head_size(n: int) -> int:
+    """Encoded size of a CBOR head (major type and argument) for argument ``n >= 0``,
+    which is also the encoded size of the unsigned integer ``n``."""
+    if n < 0x18:
+        return 1
+    if n < 0x100:
+        return 2
+    if n < 0x10000:
+        return 3
+    if n < 0x100000000:
+        return 5
+    return 9
+
+
+def _cbor_bytes_size(length: int) -> int:
+    """Encoded size of a definite-length CBOR byte string of ``length`` bytes."""
+    return _cbor_head_size(length) + length
+
+
+def _is_uint64(i: Any) -> bool:
+    return type(i) is int and 0 <= i < (1 << 64)
+
+
+def _is_original(method: Any, original: Any) -> bool:
+    """Whether the bound ``method`` is ``original`` -- not replaced by a subclass, a
+    class-level patch or an instance attribute -- so a fast path that reproduces
+    ``original`` may be used instead."""
+    return getattr(method, "__func__", None) is original
+
+
+def _encodes_as_payload(key: Any) -> bool:
+    """Whether ``key`` is encoded exactly as a CBOR byte string of its payload."""
+    cls = type(key)
+    return (
+        isinstance(key, ConstrainedBytes)
+        and cls.to_cbor is CBORSerializable.to_cbor
+        and cls.to_validated_primitive is CBORSerializable.to_validated_primitive
+        and cls.validate is CBORSerializable.validate
+        and cls.to_primitive is ConstrainedBytes.to_primitive
+    )
+
 
 FAKE_VKEY = VerificationKey.from_primitive(
     bytes.fromhex("5797dc2cc919dfec0bb849551ebdf30d96e5cbe0f33f734a87fe826db30f7ef9")
@@ -650,9 +741,7 @@ class TransactionBuilder:
         for o in outputs:
             requested += o.amount
 
-        provided = Value()
-        for i in inputs:
-            provided += i.output.amount
+        provided = _sum_values(i.output.amount for i in inputs)
 
         if self.mint:
             provided.multi_asset += self.mint
@@ -829,6 +918,147 @@ class TransactionBuilder:
         return len(attempt_amount.to_cbor()) > max_val_size
 
     def _pack_tokens_for_change(
+        self,
+        change_address: Optional[Address],
+        change_estimator: Value,
+        max_val_size: int,
+    ) -> List[MultiAsset]:
+        if _is_original(
+            self._adding_asset_make_output_overflow, _ADDING_ASSET_MAKE_OUTPUT_OVERFLOW
+        ):
+            packed = self._pack_tokens_for_change_by_size(
+                change_address, change_estimator, max_val_size
+            )
+            if packed is not None:
+                return packed
+        return self._pack_tokens_for_change_by_serialization(
+            change_address, change_estimator, max_val_size
+        )
+
+    def _pack_tokens_for_change_by_size(
+        self,
+        change_address: Optional[Address],
+        change_estimator: Value,
+        max_val_size: int,
+    ) -> Optional[List[MultiAsset]]:
+        """The packing of :meth:`_pack_tokens_for_change_by_serialization`, with each
+        candidate output's encoded size computed from its parts instead of building
+        and serializing the candidate once per asset.
+
+        Returns ``None`` when the change holds something this size model does not
+        cover exactly -- a coin or asset quantity that is not an int, negative, zero
+        (for an asset) or beyond 64 bits, an empty policy, a key that does not encode
+        as its payload, or a required lovelace beyond 64 bits -- so the caller falls
+        back to the serializing implementation.
+        """
+        coin = change_estimator.coin
+        if not _is_uint64(coin):
+            return None
+        change_policies_size = 0
+        for policy_id, assets in change_estimator.multi_asset.data.items():
+            if not assets.data or not _encodes_as_payload(policy_id):
+                return None
+            change_policies_size += _cbor_bytes_size(len(policy_id.payload))
+            change_policies_size += _cbor_head_size(len(assets.data))
+            for name, quantity in assets.data.items():
+                if (
+                    not _encodes_as_payload(name)
+                    or quantity == 0
+                    or not _is_uint64(quantity)
+                ):
+                    return None
+                change_policies_size += _cbor_bytes_size(len(name.payload))
+                change_policies_size += _cbor_head_size(quantity)
+
+        change_address = change_address or Address(FAKE_VKEY.hash())
+        coins_per_utxo_byte = self.context.protocol_param.coins_per_utxo_byte
+        # Bytes a post-Alonzo output to ``change_address`` (no datum, no script) adds
+        # around its value, measured with the encoder itself.
+        probe = Value(
+            1, MultiAsset({ScriptHash(bytes(28)): Asset({AssetName(b""): 1})})
+        )
+        output_overhead = len(
+            TransactionOutput(change_address, probe, post_alonzo=True).to_cbor()
+        ) - len(probe.to_cbor())
+
+        # Every candidate output holds part of the change and at most this coin, so
+        # this bounds the required lovelace of each one.
+        max_required_lovelace = (
+            160
+            + output_overhead
+            + 1
+            + _cbor_head_size(max(coin, 1_000_000))
+            + _cbor_head_size(len(change_estimator.multi_asset.data))
+            + change_policies_size
+        ) * coins_per_utxo_byte
+        if not _is_uint64(coins_per_utxo_byte) or not _is_uint64(max_required_lovelace):
+            return None
+
+        def overflows(output_coin: int, num_policies: int, policies_size: int) -> bool:
+            multi_asset_size = _cbor_head_size(num_policies) + policies_size
+            # min_lovelace_post_alonzo prices an output holding 0 lovelace as 1 ADA.
+            priced_coin = output_coin if output_coin != 0 else 1_000_000
+            required_lovelace = (
+                160
+                + output_overhead
+                + 1
+                + _cbor_head_size(priced_coin)
+                + multi_asset_size
+            ) * coins_per_utxo_byte
+            # [coin, multi_asset] with the coin set to the required lovelace
+            return (
+                1 + _cbor_head_size(required_lovelace) + multi_asset_size > max_val_size
+            )
+
+        packed: List[List[Tuple[ScriptHash, List[Tuple[AssetName, int]]]]] = []
+        output_coin = coin
+        output_policies: List[Tuple[ScriptHash, List[Tuple[AssetName, int]]]] = []
+        output_size = 0
+        for policy_id, assets in change_estimator.multi_asset.data.items():
+            policy_id_size = _cbor_bytes_size(len(policy_id.payload))
+            old_output = (list(output_policies), output_size)
+            temp_assets: List[Tuple[AssetName, int]] = []
+            temp_size = 0
+            for asset_name, asset_value in assets.data.items():
+                entry_size = _cbor_bytes_size(
+                    len(asset_name.payload)
+                ) + _cbor_head_size(asset_value)
+                if overflows(
+                    output_coin,
+                    len(output_policies) + 1,
+                    output_size
+                    + policy_id_size
+                    + _cbor_head_size(len(temp_assets) + 1)
+                    + temp_size
+                    + entry_size,
+                ):
+                    if temp_assets:
+                        output_policies.append((policy_id, temp_assets))
+                    packed.append(output_policies)
+                    output_coin = 0
+                    output_policies = []
+                    output_size = 0
+                    old_output = ([], 0)
+                    temp_assets = []
+                    temp_size = 0
+                temp_assets.append((asset_name, asset_value))
+                temp_size += entry_size
+
+            output_policies.append((policy_id, temp_assets))
+            output_size += (
+                policy_id_size + _cbor_head_size(len(temp_assets)) + temp_size
+            )
+            if overflows(output_coin, len(output_policies), output_size):
+                output_policies, output_size = old_output
+                break
+        packed.append(output_policies)
+
+        return [
+            MultiAsset({p: Asset(dict(names)) for p, names in policies})
+            for policies in packed
+        ]
+
+    def _pack_tokens_for_change_by_serialization(
         self,
         change_address: Optional[Address],
         change_estimator: Value,
@@ -1034,7 +1264,7 @@ class TransactionBuilder:
         else:
             sorted_withdrawals = []
 
-        for i, utxo in enumerate(self.inputs):
+        for i, utxo in enumerate(self.inputs if self._inputs_to_redeemers else ()):
             if (
                 utxo in self._inputs_to_redeemers
                 and self._inputs_to_redeemers[utxo].tag == RedeemerTag.SPEND
@@ -1155,6 +1385,9 @@ class TransactionBuilder:
         return witness_set
 
     def _build_full_fake_tx(self) -> Transaction:
+        return self._build_full_fake_tx_and_size()[0]
+
+    def _build_full_fake_tx_and_size(self) -> Tuple[Transaction, int]:
         tx_body = self._build_tx_body()
 
         if tx_body.fee == 0:
@@ -1172,7 +1405,7 @@ class TransactionBuilder:
                 f"number of inputs or outputs."
             )
 
-        return tx
+        return tx, size
 
     def build_witness_set(
         self, remove_dup_script: bool = False
@@ -1236,6 +1469,8 @@ class TransactionBuilder:
         return witness_set
 
     def _ensure_no_input_exclusion_conflict(self):
+        if not self.excluded_inputs:
+            return
         intersection = set(self.inputs).intersection(set(self.excluded_inputs))
         if intersection:
             raise TransactionBuilderException(
@@ -1257,9 +1492,14 @@ class TransactionBuilder:
         for redeemer in self._redeemer_list:
             plutus_execution_units += redeemer.ex_units
 
+        if _is_original(self._build_full_fake_tx, _BUILD_FULL_FAKE_TX):
+            fake_tx_size = self._build_full_fake_tx_and_size()[1]
+        else:
+            fake_tx_size = len(self._build_full_fake_tx().to_cbor())
+
         estimated_fee = fee(
             self.context,
-            len(self._build_full_fake_tx().to_cbor()),
+            fake_tx_size,
             plutus_execution_units.steps,
             plutus_execution_units.mem,
             self._ref_script_size(),
@@ -1322,11 +1562,8 @@ class TransactionBuilder:
                 auto_ttl_offset = 10_000
             self.ttl = max(0, last_slot + auto_ttl_offset)
 
-        selected_utxos = []
-        selected_amount = Value()
-        for i in self.inputs:
-            selected_utxos.append(i)
-            selected_amount += i.output.amount
+        selected_utxos = list(self.inputs)
+        selected_amount = _sum_values(i.output.amount for i in self.inputs)
 
         if self.mint:
             # Add positive minted amounts to the selected amount (=source)
@@ -1405,14 +1642,13 @@ class TransactionBuilder:
             lambda p, n, v: v > 0
         )
 
-        # Create a set of all seen utxos in addition to other utxo lists.
-        # We need this set to avoid adding the same utxo twice.
-        # The reason of not turning all utxo lists into sets is that we want to keep the order of utxos and make
-        # utxo selection deterministic.
-        seen_utxos = set(selected_utxos)
-
         # When there are positive coin or native asset quantity in unfulfilled Value
         if Value() < unfulfilled_amount:
+            # Create a set of all seen utxos in addition to other utxo lists.
+            # We need this set to avoid adding the same utxo twice.
+            # The reason of not turning all utxo lists into sets is that we want to keep the order of utxos and make
+            # utxo selection deterministic.
+            seen_utxos = set(selected_utxos)
             additional_utxo_pool = []
             additional_amount = Value()
 
@@ -1447,9 +1683,10 @@ class TransactionBuilder:
                         existing_amount=remaining,
                     )
 
-                    for s in selected:
-                        selected_amount += s.output.amount
-                        selected_utxos.append(s)
+                    selected_amount = _sum_values(
+                        (s.output.amount for s in selected), start=selected_amount
+                    )
+                    selected_utxos.extend(selected)
                     break
 
                 except UTxOSelectionException as e:
@@ -1836,3 +2073,11 @@ class TransactionBuilder:
             raise ValueError("Treasury donation amount must be positive")
         self.donation = amount
         return self
+
+
+# The implementations the fast paths reproduce, captured at import so that a subclass
+# override or a later patch of either method is detected and honoured.
+_BUILD_FULL_FAKE_TX = TransactionBuilder._build_full_fake_tx
+_ADDING_ASSET_MAKE_OUTPUT_OVERFLOW = (
+    TransactionBuilder._adding_asset_make_output_overflow
+)
