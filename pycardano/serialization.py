@@ -52,6 +52,7 @@ __all__ = [
     "IndefiniteTextString",
     "IndefiniteDict",
     "IndefiniteFrozenDict",
+    "CBORDeserializeException",
     "Primitive",
     "CBORBase",
     "CBORSerializable",
@@ -90,6 +91,15 @@ class Indefinite:
     """
 
 
+class CBORDeserializeException(DeserializeException, cbor2.CBORDecodeError):
+    """The payload is not CBOR that :func:`loads` accepts.
+
+    Raised for malformed input and for rejected duplicate map keys. It derives from
+    both :class:`DeserializeException` and ``cbor2.CBORDecodeError`` so callers that
+    catch either keep working.
+    """
+
+
 class IndefiniteList(Indefinite, UserList):
     def __init__(self, li: Primitive):  # type: ignore
         if isinstance(li, FrozenList):
@@ -97,9 +107,30 @@ class IndefiniteList(Indefinite, UserList):
         else:
             super().__init__(li)  # type: ignore
 
+    def __iter__(self):
+        # UserList inherits Sequence.__iter__, which indexes one item at a time.
+        return iter(self.data)
+
 
 class IndefiniteFrozenList(FrozenList, IndefiniteList):  # type: ignore
-    pass
+    """Hashable counterpart of :class:`IndefiniteList`, used for map keys.
+
+    A definite array in a map key decodes to a tuple. An indefinite one compares and
+    hashes like the tuple of its items, so the two framings of the same key are the
+    same key, as they are on the wire.
+    """
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        return FrozenList.__eq__(self, other)
+
+    def __ne__(self, other):
+        if isinstance(other, tuple):
+            return tuple(self) != other
+        return FrozenList.__ne__(self, other)
+
+    __hash__ = FrozenList.__hash__  # type: ignore[assignment]
 
 
 class IndefiniteString(Indefinite):
@@ -229,7 +260,11 @@ class IndefiniteFrozenDict(IndefiniteDict):
     """Hashable counterpart of :class:`IndefiniteDict`, used for map keys."""
 
     def __hash__(self):  # type: ignore[override]
-        return hash(frozenset(self.items()))
+        # Hash like the frozen mapping cbor2 decodes a definite map key to, so the
+        # two framings of the same key are the same key, as they are on the wire.
+        if FrozenDict is dict:
+            return hash(frozenset(self.items()))
+        return hash(FrozenDict(self))
 
     def _immutable(self, *args, **kwargs):
         raise TypeError(f"{type(self).__name__} is immutable")
@@ -241,6 +276,7 @@ class IndefiniteFrozenDict(IndefiniteDict):
     popitem = _immutable  # type: ignore[assignment]
     setdefault = _immutable  # type: ignore[assignment]
     update = _immutable  # type: ignore[assignment]
+    __ior__ = _immutable  # type: ignore[assignment]
 
 
 # cbor2 looks encoders up by exact type, so every concrete class has to be claimed
@@ -785,7 +821,10 @@ def _loads_scan(payload: bytes, **kwargs: Any) -> Any:
     # Duplicate keys collapse into a single entry on decode, which loses data and
     # makes the original encoding impossible to reproduce. Reject them by default.
     kwargs.setdefault("allow_duplicate_keys", False)
-    value = cbor2.loads(payload, semantic_decoders=semantic_decoders, **kwargs)
+    try:
+        value = cbor2.loads(payload, semantic_decoders=semantic_decoders, **kwargs)
+    except cbor2.CBORDecodeError as exc:
+        raise CBORDeserializeException(*exc.args) from exc
     shape, offset = _scan_cbor(memoryview(payload))
     if offset != len(payload):
         raise DeserializeException(

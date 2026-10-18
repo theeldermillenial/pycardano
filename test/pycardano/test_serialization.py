@@ -38,7 +38,7 @@ from pycardano import (
     VerificationKeyWitness,
     serialization,
 )
-from pycardano.cbor import cbor2
+from pycardano.cbor import FrozenDict, cbor2
 from pycardano.exception import (
     DeserializeException,
     InvalidKeyTypeException,
@@ -53,6 +53,7 @@ from pycardano.serialization import (
     DictCBORSerializable,
     Indefinite,
     IndefiniteByteString,
+    IndefiniteFrozenDict,
     IndefiniteList,
     IndefiniteString,
     IndefiniteTextString,
@@ -1185,6 +1186,45 @@ def test_duplicate_map_keys_are_rejected():
 
     with pytest.raises(cbor2.CBORDecodeError):
         loads(encoded)
+    with pytest.raises(DeserializeException):
+        loads(encoded)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        # {[1]: 2, [_ 1]: 3}: the same key written as a definite and an indefinite array.
+        "a28101029f01ff03",
+        # {{1: 2}: 3, {_ 1: 2}: 4}: the same key written as a definite and an indefinite map.
+        "a2a1010203bf0102ff04",
+        # {121([_ 1]): 2, 121([1]): 3}: Constr keys differing only in framing.
+        "a2d8799f01ff02d879810103",
+    ],
+)
+def test_duplicate_keys_differing_only_in_framing_are_rejected(encoded):
+    with pytest.raises(DeserializeException):
+        loads(bytes.fromhex(encoded))
+
+
+def test_indefinite_map_keys_compare_like_their_definite_framing():
+    key_list = loads(bytes.fromhex("a19f0102ff00"))
+    (list_key,) = key_list
+    assert isinstance(list_key, IndefiniteFrozenList)
+    assert list_key == (1, 2) and (1, 2) == list_key and not list_key != (1, 2)
+    assert hash(list_key) == hash((1, 2))
+    assert key_list[(1, 2)] == 0
+
+    key_map = loads(bytes.fromhex("a1bf0102ff00"))
+    (map_key,) = key_map
+    assert isinstance(map_key, IndefiniteFrozenDict)
+    assert map_key == FrozenDict({1: 2})
+    assert hash(map_key) == hash(FrozenDict({1: 2}))
+    with pytest.raises(TypeError):
+        map_key |= {3: 4}
+
+
+def test_indefinite_list_iterates_its_items():
+    assert list(IndefiniteList([1, 2, 3])) == [1, 2, 3]
 
 
 def test_duplicate_map_keys_allowed_explicitly_keep_their_keys():
