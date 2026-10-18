@@ -14,6 +14,7 @@ from decimal import Decimal
 from fractions import Fraction
 from functools import wraps
 from inspect import getfullargspec, isclass
+from io import BytesIO
 from typing import (
     Any,
     Callable,
@@ -713,15 +714,177 @@ def _apply_cbor_shape(value: Any, shape: _CBORShape, immutable: bool = False) ->
     return value
 
 
-def loads(payload: bytes, **kwargs: Any) -> Any:
-    """Decode CBOR while preserving order and indefinite-length containers.
+class _DeferToScan(Exception):
+    """Raised inside the streamed decode for input whose result only the scan reproduces."""
 
-    Duplicate map keys are rejected by default. They collapse into a single entry on
-    decode, which loses data and makes the original encoding impossible to reproduce.
-    Pass ``allow_duplicate_keys=True`` to decode such a payload anyway; the keys come
-    back correct, but the representation of that map and anything nested inside it is
-    not preserved, so re-encoding will not reproduce the input bytes.
-    """
+
+try:
+    # Present only in cbor2 builds that provide a token stream.
+    from cbor2 import CBORStreamDecoder as _CBORStreamDecoder  # type: ignore[attr-defined]
+    from cbor2 import tokens as _tokens  # type: ignore[attr-defined]
+except ImportError:
+    _CBORStreamDecoder = None
+else:
+    _TokInteger = _tokens.Integer
+    _TokByteString = _tokens.ByteString
+    _TokTextString = _tokens.TextString
+    _TokArrayStart = _tokens.ArrayStart
+    _TokMapStart = _tokens.MapStart
+    _TokTag = _tokens.Tag
+    _TokBreak = _tokens.Break
+    _TokByteStringStart = _tokens.ByteStringStart
+    _TokTextStringStart = _tokens.TextStringStart
+    _TokFloat = _tokens.Float
+    _TokBoolean = _tokens.Boolean
+    _TokNull = _tokens.Null
+    _TokUndefined = _tokens.Undefined
+    _TokSimple = _tokens.Simple
+    _TOK_NESTING = frozenset(
+        (
+            _TokArrayStart,
+            _TokMapStart,
+            _TokTag,
+            _TokByteStringStart,
+            _TokTextStringStart,
+        )
+    )
+
+# Tags cbor2 decodes into objects of its own (dates, decimals, shared and string
+# references, ...). The streamed decode leaves these to the scan route, which runs
+# cbor2's decoders. Tags 2, 3, 258 and 55799 are rebuilt in the streamed decode.
+_STREAM_DEFERRED_TAGS = frozenset(
+    (0, 1, 4, 5, 25, 28, 29, 30, 35, 36, 37, 52, 54, 100, 256, 260, 261, 1004, 43000)
+)
+
+# cbor2's default limit. Arrays, maps, tags and chunked strings each add a level.
+_STREAM_MAX_DEPTH = 400
+
+
+def _stream_chunks(next_token: Callable[[], Any], chunk_type: type, cls: type) -> Any:
+    parts = []
+    lengths = []
+    while True:
+        token = next_token()
+        token_type = token.__class__
+        if token_type is _TokBreak:
+            break
+        if token_type is not chunk_type:
+            raise _DeferToScan
+        parts.append(token.value)
+        lengths.append(token.length)
+    joined = ("" if chunk_type is _TokTextString else b"").join(parts)
+    return cls(joined, tuple(lengths))
+
+
+def _stream_build(
+    next_token: Callable[[], Any], token: Any, immutable: bool, depth: int
+) -> Any:
+    """Build one data item, starting at ``token``, from the rest of the token stream."""
+    token_type = token.__class__
+    if (
+        token_type is _TokInteger
+        or token_type is _TokByteString
+        or token_type is _TokTextString
+    ):
+        return token.value
+    if token_type in _TOK_NESTING:
+        if depth >= _STREAM_MAX_DEPTH:
+            raise _DeferToScan
+        depth += 1
+    if token_type is _TokArrayStart:
+        length = token.length
+        if length is not None:
+            items = [
+                _stream_build(next_token, next_token(), immutable, depth)
+                for _ in range(length)
+            ]
+            return tuple(items) if immutable else items
+        items = []
+        while (item := next_token()).__class__ is not _TokBreak:
+            items.append(_stream_build(next_token, item, immutable, depth))
+        if immutable:
+            frozen_items = IndefiniteFrozenList(items)
+            frozen_items.freeze()
+            return frozen_items
+        return IndefiniteList(items)
+    if token_type is _TokMapStart:
+        length = token.length
+        mapped: dict = {}
+        if length is None:
+            while (key_token := next_token()).__class__ is not _TokBreak:
+                key = _stream_build(next_token, key_token, True, depth)
+                if key in mapped:
+                    raise _DeferToScan
+                mapped[key] = _stream_build(next_token, next_token(), immutable, depth)
+            return IndefiniteFrozenDict(mapped) if immutable else IndefiniteDict(mapped)
+        for _ in range(length):
+            key = _stream_build(next_token, next_token(), True, depth)
+            if key in mapped:
+                raise _DeferToScan
+            mapped[key] = _stream_build(next_token, next_token(), immutable, depth)
+        return FrozenDict(mapped) if immutable else mapped
+    if token_type is _TokTag:
+        tag = token.number
+        if tag in _STREAM_DEFERRED_TAGS:
+            raise _DeferToScan
+        content = _stream_build(next_token, next_token(), immutable, depth)
+        if tag == 2 or tag == 3:
+            if not isinstance(content, bytes):
+                raise _DeferToScan
+            number = int.from_bytes(content, "big")
+            return number if tag == 2 else -1 - number
+        if tag == 55799:
+            return content
+        return CBORTag(tag, content)
+    if token_type is _TokByteStringStart:
+        return _stream_chunks(next_token, _TokByteString, IndefiniteByteString)
+    if token_type is _TokTextStringStart:
+        return _stream_chunks(next_token, _TokTextString, IndefiniteTextString)
+    if token_type is _TokFloat or token_type is _TokBoolean:
+        return token.value
+    if token_type is _TokNull:
+        return None
+    if token_type is _TokUndefined:
+        return undefined
+    if token_type is _TokSimple:
+        return CBORSimpleValue(token.value)
+    # A break outside of an indefinite-length item.
+    raise _DeferToScan
+
+
+def _loads_streamed(payload: bytes) -> Any:
+    """Decode in a single pass over cbor2's token stream, which reports framing."""
+    next_token = _CBORStreamDecoder(BytesIO(payload)).__next__
+    value = _stream_build(next_token, next_token(), False, 0)
+    try:
+        next_token()
+    except StopIteration:
+        return value
+    # Trailing bytes, complete or not.
+    raise _DeferToScan
+
+
+def _cbor2_has_stream_decoder() -> bool:
+    """Whether cbor2 provides a token stream that reports indefinite-length framing."""
+    if _CBORStreamDecoder is None:
+        return False
+    try:
+        value = _loads_streamed(b"\xd8\x79\x9f\x5f\x41\x00\xff\xff")
+    except Exception:
+        return False
+    return (
+        isinstance(value, CBORTag)
+        and type(value.value) is IndefiniteList
+        and type(value.value[0]) is IndefiniteByteString
+        and value.value[0].chunks == (1,)
+    )
+
+
+_HAS_STREAM_DECODER = _cbor2_has_stream_decoder()
+
+
+def _loads_scan(payload: bytes, **kwargs: Any) -> Any:
+    """Decode with cbor2, then restore representation from a byte scan of the input."""
     semantic_decoders = dict(kwargs.pop("semantic_decoders", {}))
     semantic_decoders.setdefault(258, _decode_ordered_set)
     # Duplicate keys collapse into a single entry on decode, which loses data and
@@ -738,6 +901,33 @@ def loads(payload: bytes, **kwargs: Any) -> Any:
             f"the top level value."
         )
     return _apply_cbor_shape(value, shape)
+
+
+def loads(payload: bytes, **kwargs: Any) -> Any:
+    """Decode CBOR while preserving order and indefinite-length containers.
+
+    Duplicate map keys are rejected by default. They collapse into a single entry on
+    decode, which loses data and makes the original encoding impossible to reproduce.
+    Pass ``allow_duplicate_keys=True`` to decode such a payload anyway; the keys come
+    back correct, but the representation of that map and anything nested inside it is
+    not preserved, so re-encoding will not reproduce the input bytes.
+
+    When the installed cbor2 provides a token stream that reports indefinite-length
+    framing, the representation is built in a single pass over it. Otherwise, when
+    cbor2 options are passed, and for any input the streamed decode does not accept
+    (invalid input, trailing bytes, and tags cbor2 decodes into objects of its own),
+    the byte scan restores it after decoding. Both routes return the same values and
+    raise the same exceptions.
+    """
+    if _HAS_STREAM_DECODER and not kwargs:
+        try:
+            return _loads_streamed(payload)
+        except Exception:
+            # Anything the streamed decode does not reproduce, including every
+            # decode error, takes the scan route, which produces the result, or the
+            # exception, for it.
+            pass
+    return _loads_scan(payload, **kwargs)
 
 
 @typechecked
