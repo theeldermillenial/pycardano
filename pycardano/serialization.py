@@ -726,9 +726,12 @@ def _hook_array(value: Any, indefinite: bool) -> Any:
         return value
     if type(value) is not list:
         # Decoded as immutable: inside a map key, or the content of a cbor2 built-in
-        # tag. IndefiniteFrozenList compares unequal to a tuple, so in a key cbor2's
-        # duplicate key check would treat keys the scan route rejects as distinct.
-        raise _DeferToScan
+        # tag, whose decoder consumes it. IndefiniteFrozenList compares and hashes
+        # like the tuple, so cbor2's duplicate key check sees the keys the scan
+        # route's cbor2 pass sees.
+        frozen = IndefiniteFrozenList(value)
+        frozen.freeze()
+        return frozen
     # The state IndefiniteList(value) builds, without copying a list nothing else
     # references.
     wrapped = _new_object(IndefiniteList)
@@ -744,9 +747,9 @@ def _hook_string(value: Union[bytes, str], chunks: tuple) -> IndefiniteString:
 
 def _hook_map(value: Any) -> IndefiniteDict:
     if type(value) is not dict:
-        # Decoded as immutable, as above. IndefiniteFrozenDict hashes differently
-        # from cbor2's frozendict, which would hide a duplicate key the same way.
-        raise _DeferToScan
+        # Decoded as immutable, as above. IndefiniteFrozenDict compares and hashes
+        # like cbor2's frozendict for the same reason.
+        return IndefiniteFrozenDict(value)
     return IndefiniteDict(value)
 
 
@@ -798,6 +801,10 @@ def _cbor2_has_decode_hooks() -> bool:
 
 
 _HAS_DECODE_HOOKS = _cbor2_has_decode_hooks()
+
+# How many hooked decodes fell back to the scan route, by reason: "deferred" for input
+# only the scan reproduces, "invalid" for input that fails to decode.
+_HOOKED_DECODE_FALLBACKS: Dict[str, int] = {"deferred": 0, "invalid": 0}
 
 
 def _loads_hooked(payload: bytes) -> Any:
@@ -852,10 +859,16 @@ def loads(payload: bytes, **kwargs: Any) -> Any:
     if _HAS_DECODE_HOOKS and not kwargs:
         try:
             return _loads_hooked(payload)
-        except Exception:
-            # Invalid input, or input the hooked decode defers on: the scan route
+        except cbor2.CBORDecodeError as exc:
+            # cbor2 wraps exceptions raised in hooks and semantic decoders. Input the
+            # hooked decode defers on, and invalid input, take the scan route, which
             # produces the result, or the exception, for it.
-            pass
+            reason = (
+                "deferred" if isinstance(exc.__cause__, _DeferToScan) else "invalid"
+            )
+            _HOOKED_DECODE_FALLBACKS[reason] += 1
+        except _DeferToScan:
+            _HOOKED_DECODE_FALLBACKS["invalid"] += 1
     return _loads_scan(payload, **kwargs)
 
 

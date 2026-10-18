@@ -1478,6 +1478,11 @@ def _representation(value):
         "d8237f63616263ff",
         "a201020103",
         "a29f01ff02810103",
+        "a1d8799f01ff02",
+        "a2d8799f01ff02d879810103",
+        "a1bf0102ff03",
+        "a2a1010203bf0102ff04",
+        "a1d8799fbf9f01ff02ffff03",
         "0001",
         "8201",
         "ff",
@@ -1517,4 +1522,24 @@ def test_hooked_decode_does_not_scan(monkeypatch):
     assert isinstance(decoded.value, IndefiniteList)
     assert decoded.value[0].chunks == (64, 8)
     assert type(decoded.value[1]) is serialization.IndefiniteDict
+    assert dumps(decoded) == encoded
+
+
+@pytest.mark.skipif(
+    not serialization._HAS_DECODE_HOOKS, reason="cbor2 has no indefinite-length hooks"
+)
+def test_hooked_decode_handles_indefinite_map_keys_without_scanning(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("the byte scan ran")
+
+    monkeypatch.setattr(serialization, "_loads_scan", fail)
+    # 121([{121([_ 121([_ h'', h''])]): 1, {_ 2: 3}: 4}]): Constr keys, as in a Plutus
+    # map keyed by an asset class, and an indefinite map key.
+    encoded = bytes.fromhex("d87981a2d8799fd8799f4040ffff01bf0203ff04")
+
+    decoded = loads(encoded)
+
+    constr_key, map_key = decoded.value[0]
+    assert type(constr_key.value) is IndefiniteFrozenList
+    assert type(map_key) is IndefiniteFrozenDict
     assert dumps(decoded) == encoded

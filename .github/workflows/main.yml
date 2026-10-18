@@ -47,6 +47,32 @@ jobs:
         run: |
           make qa
 
+  build-cbor2-decode-hooks:
+    # The unit tests again on the cbor2 build that reports indefinite-length framing
+    # through decode hooks, so the hooked decode is exercised as well as the byte
+    # scan the job above runs on stock cbor2.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'poetry'
+      - name: Install dependencies
+        run: |
+          poetry install
+          poetry run pip install "cbor2 @ git+https://github.com/theeldermillenial/cbor2.git@6.1.5.post2"
+      - name: Check the hooked decode is active
+        run: |
+          poetry run python -c "import pycardano.serialization as s; assert s._HAS_DECODE_HOOKS"
+      - name: Run unit tests
+        run: |
+          poetry run pytest --doctest-modules --ignore=examples
+
   continuous-integration:
     runs-on: ${{ matrix.os }}
     strategy:
