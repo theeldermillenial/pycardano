@@ -5,6 +5,11 @@ description = "A Cardano library in Python"
 requires-python = ">=3.10"
 dynamic = ["dependencies"]
 
+[project.optional-dependencies]
+# Decodes in a single pass instead of decoding and then re-scanning the payload. See
+# "Optional cbor2pure decoder" in the docs.
+cbor2pure = ["cbor2pure>=6.1.5,<7"]
+
 [tool.poetry]
 name = "pycardano"
 version = "0.19.2"

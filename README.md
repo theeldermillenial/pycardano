@@ -61,6 +61,15 @@ Install the library using [pip](https://pip.pypa.io/en/stable/):
 [cbor2](https://github.com/agronholm/cbor2/tree/master) is a dependency of pycardano. It is used to encode and decode CBOR data.
 PyCardano requires cbor2 6 or later and preserves the CBOR container representation needed for deterministic transaction round trips.
 
+#### Optional cbor2pure decoder
+To keep the original encoding (indefinite-length containers, chunked strings), PyCardano decodes with cbor2 and then re-scans the payload.
+The `cbor2pure` extra installs [cbor2pure](https://github.com/cffls/cbor2pure), cbor2's decoder with hooks that report that encoding, so PyCardano decodes in a single pass instead:
+
+`pip install "pycardano[cbor2pure]"`
+
+When cbor2pure is installed, PyCardano uses it in place of cbor2 for decoding; encoding always uses cbor2.
+Decoded values, re-encoded bytes and exceptions are the same with or without it; only decoding speed differs.
+
 ### Documentation
 
 https://pycardano.readthedocs.io/en/latest/

@@ -12,6 +12,21 @@ PyCardano could be installed using ``pip`` as follows:
 
    $ pip install pycardano
 
+Optional cbor2pure decoder
+--------------------------
+
+To decode in a single pass, install the ``cbor2pure`` extra:
+
+.. code-block:: shell
+
+   $ pip install "pycardano[cbor2pure]"
+
+`cbor2pure <https://github.com/cffls/cbor2pure>`_ is cbor2's decoder with hooks that
+report indefinite-length containers and string chunks. When it is installed, PyCardano
+decodes with it instead of decoding with cbor2 and then re-scanning the payload to
+restore that encoding. Encoding always uses cbor2, and the results are the same with or
+without it; only decoding speed differs.
+
 
 ---------------
 Using PyCardano
