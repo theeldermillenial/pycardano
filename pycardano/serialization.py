@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import types
 import typing
 from collections import OrderedDict, UserList, defaultdict
 from copy import deepcopy
@@ -1563,8 +1564,29 @@ def _build_decode_plan(t: typing.Type) -> Callable[[Any], Any]:
     return plan_unsupported
 
 
+_UNION_ORIGINS: tuple = (Union,) + (
+    (types.UnionType,) if hasattr(types, "UnionType") else ()
+)
+
+
+def _contains_union(t: Any) -> bool:
+    """Whether ``t`` is a ``Union`` or has one among its (nested) type arguments."""
+    if typing.get_origin(t) in _UNION_ORIGINS:
+        return True
+    return any(_contains_union(a) for a in typing.get_args(t))
+
+
 def _decode_plan(t: typing.Type) -> Callable[[Any], Any]:
-    """Return a memoized decode plan for ``t``, building it on first use."""
+    """Return a memoized decode plan for ``t``, building it on first use.
+
+    Types containing a ``Union`` are not shared through the cache: ``Union`` equality
+    and hash ignore member order (``Union[A, B] == Union[B, A]``), but a union plan
+    tries its members in declaration order, so a cached plan for one ordering would
+    be served for the other. Each field still memoizes its own plan through
+    ``_lazy_field_handler``.
+    """
+    if _contains_union(t):
+        return _build_decode_plan(t)
     try:
         plan = _DECODE_PLAN_CACHE.get(t)
     except TypeError:  # pragma: no cover - real field types are hashable
@@ -2070,6 +2092,8 @@ class OrderedSet(Generic[T], CBORSerializable):
         a sentinel so they cannot collide with a hashable key."""
         try:
             hash(item)
+        except RecursionError:
+            raise
         except (TypeError, RuntimeError):
             # TypeError: ordinary unhashable value. RuntimeError: cbor2 6.x raises this
             # for a CBORTag whose value is not hashable.
