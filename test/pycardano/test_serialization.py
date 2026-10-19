@@ -1236,3 +1236,80 @@ def test_liqwid_tx():
         cbor_hex = json.load(f).get("cborHex")
     tx = Transaction.load("test/resources/cbors/liqwid.json")
     assert tx.to_cbor().hex() == cbor_hex
+
+
+def _union_order_classes():
+    @dataclass
+    class A(PlutusData):
+        CONSTR_ID = 0
+        f: int
+
+    @dataclass
+    class B(PlutusData):
+        CONSTR_ID = 0
+        f: int
+
+    @dataclass
+    class AB(PlutusData):
+        CONSTR_ID = 1
+        v: Union[A, B]
+
+    @dataclass
+    class BA(PlutusData):
+        CONSTR_ID = 1
+        v: Union[B, A]
+
+    return A, B, AB, BA
+
+
+@pytest.mark.parametrize("ab_first", [True, False])
+def test_union_field_tries_members_in_declared_order(ab_first):
+    # Union[A, B] == Union[B, A], yet each field must try its own members in order,
+    # whichever class is decoded first.
+    A, B, AB, BA = _union_order_classes()
+    encoded = AB(A(5)).to_cbor()
+    order = [(AB, A), (BA, B)] if ab_first else [(BA, B), (AB, A)]
+    for cls, expected in order:
+        assert type(cls.from_cbor(encoded).v) is expected
+
+
+def test_ordered_set_dedup_propagates_recursion_error():
+    class TooDeep:
+        def __hash__(self):
+            raise RecursionError("maximum recursion depth exceeded")
+
+    with pytest.raises(RecursionError):
+        OrderedSet([TooDeep()])
+
+
+@pytest.mark.parametrize("first", [0, 1])
+def test_union_member_order_is_per_field(first):
+    """Union[A, B] == Union[B, A], so decode plans must not be shared between fields
+    that list the same members in a different order: each field tries its own members
+    in its own declared order, whichever field is decoded first."""
+
+    @dataclass
+    class _A(ArrayCBORSerializable):
+        x: int
+
+    @dataclass
+    class _B(ArrayCBORSerializable):
+        x: int
+
+    @dataclass
+    class _AB(ArrayCBORSerializable):
+        v: Union[_A, _B]
+        vs: list[Union[_A, _B]]
+
+    @dataclass
+    class _BA(ArrayCBORSerializable):
+        v: Union[_B, _A]
+        vs: list[Union[_B, _A]]
+
+    primitive = [[5], [[6]]]
+    expected = {_AB: _A, _BA: _B}
+    holders = [_AB, _BA] if first == 0 else [_BA, _AB]
+    for holder in holders:
+        restored = holder.from_primitive(primitive)
+        assert type(restored.v) is expected[holder]
+        assert type(restored.vs[0]) is expected[holder]
