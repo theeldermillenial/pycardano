@@ -1,7 +1,7 @@
 import json
 import os
 import tempfile
-from collections import defaultdict, deque
+from collections import UserList, defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -36,6 +36,7 @@ from pycardano import (
     TransactionWitnessSet,
     VerificationKey,
     VerificationKeyWitness,
+    serialization,
 )
 from pycardano.cbor import cbor2
 from pycardano.exception import (
@@ -54,6 +55,7 @@ from pycardano.serialization import (
     IndefiniteByteString,
     IndefiniteFrozenDict,
     IndefiniteList,
+    IndefiniteString,
     IndefiniteTextString,
     MapCBORSerializable,
     NonEmptyOrderedSet,
@@ -1419,3 +1421,132 @@ def test_liqwid_tx():
         cbor_hex = json.load(f).get("cborHex")
     tx = Transaction.load("test/resources/cbors/liqwid.json")
     assert tx.to_cbor().hex() == cbor_hex
+
+
+def _representation(value):
+    """Types, values and chunk lengths of a decoded tree, for comparing decodes."""
+    if isinstance(value, IndefiniteString):
+        return type(value), value, value.chunks
+    if isinstance(value, CBORTag):
+        return type(value), value.tag, _representation(value.value)
+    if isinstance(value, (list, tuple, UserList)):
+        return type(value), [_representation(item) for item in value]
+    if isinstance(value, dict):
+        return type(value), [
+            (_representation(k), _representation(v)) for k, v in value.items()
+        ]
+    return type(value), value
+
+
+@pytest.mark.parametrize(
+    "cbor_hex",
+    [
+        "d8799f5f5840" + "aa" * 64 + "48" + "bb" * 8 + "ffff",
+        "9f809fff80a0bfff5fff7fffff",
+        "5f4040ff",
+        "7f62c3a96161ff",
+        "bf5f4101ff9f01ffff",
+        "a17f6161ffbf0102ff",
+        "a19f01ff02",
+        "a1bf0102ff03",
+        "a1d8799f01ff02",
+        "d901029f0102ff",
+        "a1d90102818001",
+        "d9d9f7820102",
+        "d9d9f79f0102ff",
+        "c25f41014100ff",
+        "82d81c9f01ffd81d00",
+        "d8237f63616263ff",
+        "a201020103",
+        "a29f01ff02810103",
+        "a1d8799f01ff02",
+        "a2d8799f01ff02d879810103",
+        "a1bf0102ff03",
+        "a2a1010203bf0102ff04",
+        "a1d8799fbf9f01ff02ffff03",
+        "0001",
+        "8201",
+        "ff",
+    ],
+)
+def test_decode_routes_agree(cbor_hex):
+    """loads matches the scan route exactly, whichever route the cbor2 build allows."""
+    from pycardano.serialization import _loads_scan
+
+    encoded = bytes.fromhex(cbor_hex)
+    outcomes = []
+    for decode in (loads, _loads_scan):
+        try:
+            decoded = decode(encoded)
+        except Exception as error:
+            outcomes.append((type(error), str(error)))
+        else:
+            outcomes.append((_representation(decoded), dumps(decoded)))
+
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.skipif(
+    not serialization._HAS_DECODE_HOOKS, reason="cbor2 has no indefinite-length hooks"
+)
+def test_hooked_decode_does_not_scan(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("the byte scan ran")
+
+    monkeypatch.setattr(serialization, "_loads_scan", fail)
+    encoded = bytes.fromhex(
+        "d8799f5f5840" + "aa" * 64 + "48" + "bb" * 8 + "ffbf0102ffff"
+    )
+
+    decoded = loads(encoded)
+
+    assert isinstance(decoded.value, IndefiniteList)
+    assert decoded.value[0].chunks == (64, 8)
+    assert type(decoded.value[1]) is serialization.IndefiniteDict
+    assert dumps(decoded) == encoded
+
+
+@pytest.mark.skipif(
+    not serialization._HAS_DECODE_HOOKS, reason="cbor2 has no indefinite-length hooks"
+)
+def test_hooked_decode_handles_indefinite_map_keys_without_scanning(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("the byte scan ran")
+
+    monkeypatch.setattr(serialization, "_loads_scan", fail)
+    # 121([{121([_ 121([_ h'', h''])]): 1, {_ 2: 3}: 4}]): Constr keys, as in a Plutus
+    # map keyed by an asset class, and an indefinite map key.
+    encoded = bytes.fromhex("d87981a2d8799fd8799f4040ffff01bf0203ff04")
+
+    decoded = loads(encoded)
+
+    constr_key, map_key = decoded.value[0]
+    assert type(constr_key.value) is IndefiniteFrozenList
+    assert type(map_key) is IndefiniteFrozenDict
+    assert dumps(decoded) == encoded
+
+
+def test_decoder_probe_rejects_modules_without_hooks_or_cbor2_types():
+    from types import SimpleNamespace
+
+    def no_hooks(payload):
+        return cbor2.loads(payload)
+
+    def own_errors(payload, **hooks):
+        raise TypeError
+
+    assert not serialization._has_decode_hooks(
+        SimpleNamespace(CBORDecodeError=cbor2.CBORDecodeError, loads=no_hooks)
+    )
+    assert not serialization._has_decode_hooks(
+        SimpleNamespace(CBORDecodeError=ValueError, loads=own_errors)
+    )
+    assert not serialization._has_decode_hooks(SimpleNamespace())
+
+
+def test_hooked_decode_uses_cbor2pure_when_installed():
+    from pycardano.cbor import cbor2pure
+
+    if cbor2pure is None:
+        pytest.skip("cbor2pure is not installed")
+    assert serialization._HOOKED_DECODER is cbor2pure

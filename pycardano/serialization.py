@@ -14,6 +14,7 @@ from decimal import Decimal
 from fractions import Fraction
 from functools import wraps
 from inspect import getfullargspec, isclass
+from io import BytesIO
 from typing import (
     Any,
     Callable,
@@ -30,7 +31,7 @@ from typing import (
     get_type_hints,
 )
 
-from pycardano.cbor import cbor2
+from pycardano.cbor import cbor2, cbor2pure
 
 from cbor2 import (
     CBOREncoder,
@@ -622,15 +623,137 @@ def _apply_cbor_shape(value: Any, shape: _CBORShape, immutable: bool = False) ->
     return value
 
 
-def loads(payload: bytes, **kwargs: Any) -> Any:
-    """Decode CBOR while preserving order and indefinite-length containers.
+class _DeferToScan(Exception):
+    """Raised inside the hooked decode for input whose result only the scan reproduces."""
 
-    Duplicate map keys are rejected by default. They collapse into a single entry on
-    decode, which loses data and makes the original encoding impossible to reproduce.
-    Pass ``allow_duplicate_keys=True`` to decode such a payload anyway; the keys come
-    back correct, but the representation of that map and anything nested inside it is
-    not preserved, so re-encoding will not reproduce the input bytes.
+
+_new_object = object.__new__
+
+
+def _hook_array(value: Any, indefinite: bool) -> Any:
+    if not indefinite:
+        return value
+    if type(value) is not list:
+        # Decoded as immutable: inside a map key, or the content of a cbor2 built-in
+        # tag, whose decoder consumes it. IndefiniteFrozenList compares and hashes
+        # like the tuple, so cbor2's duplicate key check sees the keys the scan
+        # route's cbor2 pass sees.
+        frozen = IndefiniteFrozenList(value)
+        frozen.freeze()
+        return frozen
+    # The state IndefiniteList(value) builds, without copying a list nothing else
+    # references.
+    wrapped = _new_object(IndefiniteList)
+    wrapped.data = value
+    return wrapped
+
+
+def _hook_string(value: Union[bytes, str], chunks: tuple) -> IndefiniteString:
+    if isinstance(value, bytes):
+        return IndefiniteByteString(value, chunks)
+    return IndefiniteTextString(value, chunks)
+
+
+def _hook_map(value: Any) -> IndefiniteDict:
+    if type(value) is not dict:
+        # Decoded as immutable, as above. IndefiniteFrozenDict compares and hashes
+        # like cbor2's frozendict for the same reason.
+        return IndefiniteFrozenDict(value)
+    return IndefiniteDict(value)
+
+
+def _defer_to_scan(value: Any, immutable: bool) -> Any:
+    raise _DeferToScan
+
+
+def _decode_self_describe(value: Any, immutable: bool) -> Any:
+    # cbor2's built-in decoder for this tag decodes the content as immutable even
+    # outside of map keys. A registered decoder receives it decoded for its position.
+    return value
+
+
+# Tags whose decoded value no longer mirrors the wire structure in the way the scan
+# route expects: shared references (28, 29) resolve to an object the scan does not
+# revisit, and regular expressions (35) and MIME messages (36) keep the decoded
+# string inside the result. Deferring keeps both routes identical for them.
+_HOOKED_SEMANTIC_DECODERS = {
+    258: _decode_ordered_set,
+    55799: _decode_self_describe,
+    28: _defer_to_scan,
+    29: _defer_to_scan,
+    35: _defer_to_scan,
+    36: _defer_to_scan,
+}
+
+
+# Passed as keyword arguments that cbor2 builds without these hooks do not accept.
+_DECODE_HOOKS: Dict[str, Any] = {
+    "array_hook": _hook_array,
+    "indefinite_string_hook": _hook_string,
+    "indefinite_map_hook": _hook_map,
+}
+
+
+def _has_decode_hooks(module: Any) -> bool:
+    """Whether ``module`` reports array, indefinite string and indefinite map framing
+    through decode hooks, and decodes unknown tag content as mutable outside of map
+    keys. The hooked decode relies on both, and on the module returning cbor2's value
+    classes and raising cbor2's exceptions, so that its results match the scan route's.
     """
+    error = getattr(module, "CBORDecodeError", None)
+    if not (isclass(error) and issubclass(error, cbor2.CBORDecodeError)):
+        return False
+    try:
+        # [121([_ h'']), undefined, simple(16), {{}: 0}]
+        value = module.loads(
+            b"\x84\xd8\x79\x81\x5f\xff\xf7\xf0\xa1\xa0\x00", **_DECODE_HOOKS
+        )
+    except Exception:
+        return False
+    return (
+        type(value) is list
+        and type(value[0]) is CBORTag
+        and type(value[0].value) is list
+        and type(value[0].value[0]) is IndefiniteByteString
+        and value[1] is undefined
+        and type(value[2]) is CBORSimpleValue
+        and type(next(iter(value[3]))) is FrozenDict
+    )
+
+
+def _select_hooked_decoder() -> Any:
+    """The module the hooked decode uses: cbor2pure when it is installed and passes the
+    probe, otherwise cbor2 if it has the same hooks, otherwise None."""
+    for module in (cbor2pure, cbor2):
+        if module is not None and _has_decode_hooks(module):
+            return module
+    return None
+
+
+_HOOKED_DECODER = _select_hooked_decoder()
+_HAS_DECODE_HOOKS = _HOOKED_DECODER is not None
+
+# How many hooked decodes fell back to the scan route, by reason: "deferred" for input
+# only the scan reproduces, "invalid" for input that fails to decode.
+_HOOKED_DECODE_FALLBACKS: Dict[str, int] = {"deferred": 0, "invalid": 0}
+
+
+def _loads_hooked(payload: bytes) -> Any:
+    """Decode in a single cbor2 pass, building indefinite-length types in the hooks."""
+    stream = BytesIO(payload)
+    value = _HOOKED_DECODER.CBORDecoder(
+        stream,
+        semantic_decoders=_HOOKED_SEMANTIC_DECODERS,
+        allow_duplicate_keys=False,
+        **_DECODE_HOOKS,
+    ).decode()
+    if stream.read(1):
+        raise _DeferToScan
+    return value
+
+
+def _loads_scan(payload: bytes, **kwargs: Any) -> Any:
+    """Decode with cbor2, then restore representation from a byte scan of the input."""
     semantic_decoders = dict(kwargs.pop("semantic_decoders", {}))
     semantic_decoders.setdefault(258, _decode_ordered_set)
     # Duplicate keys collapse into a single entry on decode, which loses data and
@@ -644,6 +767,37 @@ def loads(payload: bytes, **kwargs: Any) -> Any:
             f"the top level value."
         )
     return _apply_cbor_shape(value, shape)
+
+
+def loads(payload: bytes, **kwargs: Any) -> Any:
+    """Decode CBOR while preserving order and indefinite-length containers.
+
+    Duplicate map keys are rejected by default. They collapse into a single entry on
+    decode, which loses data and makes the original encoding impossible to reproduce.
+    Pass ``allow_duplicate_keys=True`` to decode such a payload anyway; the keys come
+    back correct, but the representation of that map and anything nested inside it is
+    not preserved, so re-encoding will not reproduce the input bytes.
+
+    When cbor2pure is installed (the ``cbor2pure`` extra), it reports indefinite-length
+    framing through decode hooks, and the representation is built during a single
+    decode pass. Otherwise, when cbor2 options are passed, and for any input the hooked
+    decode does not accept, cbor2 decodes the payload and a byte scan restores the
+    representation. Both routes return the same values and raise the same exceptions.
+    """
+    if _HAS_DECODE_HOOKS and not kwargs:
+        try:
+            return _loads_hooked(payload)
+        except cbor2.CBORDecodeError as exc:
+            # cbor2 wraps exceptions raised in hooks and semantic decoders. Input the
+            # hooked decode defers on, and invalid input, take the scan route, which
+            # produces the result, or the exception, for it.
+            reason = (
+                "deferred" if isinstance(exc.__cause__, _DeferToScan) else "invalid"
+            )
+            _HOOKED_DECODE_FALLBACKS[reason] += 1
+        except _DeferToScan:
+            _HOOKED_DECODE_FALLBACKS["invalid"] += 1
+    return _loads_scan(payload, **kwargs)
 
 
 @typechecked

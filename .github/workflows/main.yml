@@ -47,6 +47,39 @@ jobs:
         run: |
           make qa
 
+  build-cbor2pure:
+    # The unit tests again with the cbor2pure extra installed, so the single-pass hooked
+    # decode is exercised as well as the byte scan the job above runs on cbor2 alone.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.13']
+    env:
+      # cbor2pure is installed from its source until a release with the decode hooks is
+      # on PyPI; then this becomes `poetry install --extras cbor2pure`.
+      CBOR2PURE: "cbor2pure @ git+https://github.com/cffls/cbor2pure.git@master"
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_CBOR2PURE: "6.1.5"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'poetry'
+      - name: Install dependencies
+        run: |
+          poetry install
+          poetry run pip install "$CBOR2PURE"
+      - name: Check the hooked decode uses cbor2pure
+        run: |
+          poetry run python -c "import cbor2pure, pycardano.serialization as s; assert s._HOOKED_DECODER is cbor2pure, s._HOOKED_DECODER"
+      - name: Run unit tests
+        run: |
+          poetry run pytest --doctest-modules --ignore=examples
+
   continuous-integration:
     runs-on: ${{ matrix.os }}
     strategy:
