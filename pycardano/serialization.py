@@ -94,7 +94,24 @@ class IndefiniteList(Indefinite, UserList):
 
 
 class IndefiniteFrozenList(FrozenList, IndefiniteList):  # type: ignore
-    pass
+    """Hashable counterpart of :class:`IndefiniteList`, used for map keys.
+
+    A definite array in a map key decodes to a tuple. An indefinite one compares and
+    hashes like the tuple of its items, so the two framings of the same key are the
+    same key, as they are on the wire.
+    """
+
+    def __eq__(self, other):
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        return FrozenList.__eq__(self, other)
+
+    def __ne__(self, other):
+        if isinstance(other, tuple):
+            return tuple(self) != other
+        return FrozenList.__ne__(self, other)
+
+    __hash__ = FrozenList.__hash__  # type: ignore[assignment]
 
 
 class IndefiniteString(Indefinite):
@@ -224,7 +241,9 @@ class IndefiniteFrozenDict(IndefiniteDict):
     """Hashable counterpart of :class:`IndefiniteDict`, used for map keys."""
 
     def __hash__(self):  # type: ignore[override]
-        return hash(frozenset(self.items()))
+        # Hash like the frozen mapping cbor2 decodes a definite map key to, so the
+        # two framings of the same key are the same key, as they are on the wire.
+        return hash(FrozenDict(self))
 
     def _immutable(self, *args, **kwargs):
         raise TypeError(f"{type(self).__name__} is immutable")
