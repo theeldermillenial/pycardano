@@ -24,6 +24,7 @@ from pycardano.certificate import (
     StakeRegistrationConway,
     VoteDelegation,
 )
+from pycardano.change import ChangeStrategy
 from pycardano.coinselection import (
     LargestFirstSelector,
     RandomImproveMultiAsset,
@@ -202,6 +203,11 @@ def _ledger_reward_account_order(reward_account: bytes) -> Tuple[int, int, bytes
     return header & 0x0F, credential_rank, reward_account[1:]
 
 
+def _outputs_cbor_len(outputs: List[TransactionOutput]) -> int:
+    """The summed CBOR length of a list of outputs."""
+    return sum(len(output.to_cbor()) for output in outputs)
+
+
 @dataclass
 class TransactionBuilder:
     """A class builder that makes it easy to build a transaction."""
@@ -283,6 +289,14 @@ class TransactionBuilder:
     collateral_return_threshold: int = 1_000_000
     """The minimum amount of lovelace above which
     the remaining collateral (total_collateral_amount - actually_used_amount) will be returned."""
+
+    change_strategy: Optional[ChangeStrategy] = field(default=None)
+    """Decides how the change is divided into outputs. None keeps the default change:
+    tokens packed up to ``max_val_size``, with the leftover ADA in the last output.
+
+    Input selection still reserves ADA for the default change. When the selected ADA cannot
+    fund the strategy's outputs, or when they would make the transaction too large, the
+    default change is used instead. Ignored when ``merge_change`` is set."""
 
     _total_collateral: Optional[int] = field(init=False, default=None)
 
@@ -750,6 +764,28 @@ class TransactionBuilder:
     def _calc_change(
         self, fees, inputs, outputs, address, precise_fee=False, respect_min_utxo=True
     ) -> List[TransactionOutput]:
+        change, _ = self._calc_change_shaped(
+            fees, inputs, outputs, address, precise_fee, respect_min_utxo
+        )
+        assert change is not None  # the strategy is not used, so never None
+        return change
+
+    def _calc_change_shaped(
+        self,
+        fees,
+        inputs,
+        outputs,
+        address,
+        precise_fee=False,
+        respect_min_utxo=True,
+        use_change_strategy=False,
+        default_on_decline=True,
+    ) -> Tuple[Optional[List[TransactionOutput]], bool]:
+        """The change outputs, and whether they are the change strategy's.
+
+        When the change strategy declines and ``default_on_decline`` is False, the
+        outputs are None: the default change is not computed.
+        """
         requested = Value(fees)
         for o in outputs:
             requested += o.amount
@@ -785,6 +821,74 @@ class TransactionBuilder:
         if change.multi_asset:
             change.multi_asset = change.multi_asset.filter(lambda p, n, v: v > 0)
 
+        if use_change_strategy and self.change_strategy is not None:
+            if isinstance(address, str):
+                address = Address.from_primitive(address)
+            shaped = self.change_strategy.change_outputs(
+                deepcopy(change), address, self.context
+            )
+            if shaped is not None:
+                self._check_change_outputs(change, shaped, address)
+                return shaped, True
+            if not default_on_decline:
+                return None, False
+        return self._default_change_outputs(change, address, respect_min_utxo), False
+
+    def _check_change_outputs(
+        self, change: Value, outputs: List[TransactionOutput], address: Address
+    ) -> None:
+        """Check a change strategy's outputs against the strategy contract.
+
+        Raises:
+            InvalidTransactionException: When the outputs do not sum to ``change``, or an
+                output pays another address, carries a datum or a script, holds an asset
+                with a non-positive quantity, or has a value larger than ``max_val_size``.
+            InsufficientUTxOBalanceException: When an output holds less than its min-ADA.
+        """
+        name = type(self.change_strategy).__name__
+        max_val_size = self.context.protocol_param.max_val_size
+        total = Value()
+        for output in outputs:
+            if output.address != address:
+                raise InvalidTransactionException(
+                    f"{name}: a change output pays {output.address}, "
+                    f"not the change address {address}"
+                )
+            if output.datum is not None or output.datum_hash is not None:
+                raise InvalidTransactionException(
+                    f"{name}: a change output carries a datum"
+                )
+            if output.script is not None:
+                raise InvalidTransactionException(
+                    f"{name}: a change output carries a script"
+                )
+            if output.amount.multi_asset.count(lambda p, n, v: v <= 0) > 0:
+                raise InvalidTransactionException(
+                    f"{name}: a change output holds an asset with a non-positive quantity"
+                )
+            value_size = len(output.amount.to_cbor())
+            if value_size > max_val_size:
+                raise InvalidTransactionException(
+                    f"{name}: a change output's value is {value_size} bytes, "
+                    f"above max_val_size ({max_val_size})"
+                )
+            total += output.amount
+        if total != change:
+            raise InvalidTransactionException(
+                f"{name}: the change outputs sum to {total}, not to the change {change}"
+            )
+        for output in outputs:
+            # min_lovelace_post_alonzo sets a coin of 0 in place, so probe a copy
+            min_lovelace = min_lovelace_post_alonzo(deepcopy(output), self.context)
+            if output.amount.coin < min_lovelace:
+                raise InsufficientUTxOBalanceException(
+                    f"{name}: a change output holds {output.amount.coin} lovelace, "
+                    f"below its min-ADA {min_lovelace}"
+                )
+
+    def _default_change_outputs(
+        self, change: Value, address: Address, respect_min_utxo: bool
+    ) -> List[TransactionOutput]:
         change_output_arr = []
 
         # when there is only ADA left, simply use remaining coin value as change
@@ -838,7 +942,52 @@ class TransactionBuilder:
         change_address: Optional[Address],
         merge_change: Optional[bool] = False,
     ) -> TransactionBuilder:
+        if not change_address:
+            self.fee = self._estimate_fee()
+            return self
+
+        use_strategy = self.change_strategy is not None and not merge_change
         original_outputs = deepcopy(self.outputs)
+        original_fee = self.fee
+
+        reason = self._change_passes(
+            change_address, merge_change, original_outputs, use_strategy
+        )
+        if reason is not None:
+            name = type(self.change_strategy).__name__
+            if reason == "monotonicity":
+                logger.warning(
+                    "change strategy %s: change grew as the coin fell; "
+                    "using the default change",
+                    name,
+                )
+            else:
+                logger.info(
+                    "change strategy %s fell back to the default change (%s)",
+                    name,
+                    reason,
+                )
+            # Restore the entry state so the rerun is exactly the default computation.
+            self._outputs = deepcopy(original_outputs)
+            self.fee = original_fee
+            self._change_passes(change_address, merge_change, original_outputs, False)
+
+        return self
+
+    def _change_passes(
+        self,
+        change_address: Address,
+        merge_change: Optional[bool],
+        original_outputs: List[TransactionOutput],
+        use_strategy: bool,
+    ) -> Optional[str]:
+        """Estimate the fee and add the change in two passes.
+
+        Returns:
+            Optional[str]: Why the change strategy's result must be replaced by the
+            default change (``"size"``, ``"pass2"`` or ``"monotonicity"``), or None when
+            the change is final. Never returns a reason when ``use_strategy`` is False.
+        """
         change_output_index = None
 
         def _merge_changes(changes):
@@ -852,45 +1001,60 @@ class TransactionBuilder:
             else:
                 self._outputs += changes
 
-        if change_address:
-            if merge_change:
-                for idx, output in enumerate(original_outputs):
-                    # Find any transaction outputs which already contain the change address
-                    if change_address == output.address:
-                        if change_output_index is None or output.lovelace == 0:
-                            change_output_index = idx
+        if merge_change:
+            for idx, output in enumerate(original_outputs):
+                # Find any transaction outputs which already contain the change address
+                if change_address == output.address:
+                    if change_output_index is None or output.lovelace == 0:
+                        change_output_index = idx
 
-            # Set fee to max
-            self.fee = self._estimate_fee()
-
-            changes = self._calc_change(
-                self.fee,
-                self.inputs,
-                self.outputs,
-                change_address,
-                precise_fee=True,
-                respect_min_utxo=not merge_change,
-            )
-
-            _merge_changes(changes)
-
-        # With changes included, we can estimate the fee more precisely
+        # Set fee to max
         self.fee = self._estimate_fee()
 
-        if change_address:
-            self._outputs = original_outputs
-            changes = self._calc_change(
-                self.fee,
-                self.inputs,
-                self.outputs,
-                change_address,
-                precise_fee=True,
-                respect_min_utxo=not merge_change,
-            )
+        first, first_shaped = self._calc_change_shaped(
+            self.fee,
+            self.inputs,
+            self.outputs,
+            change_address,
+            precise_fee=True,
+            respect_min_utxo=not merge_change,
+            use_change_strategy=use_strategy,
+        )
+        assert first is not None  # a declining strategy gets the default change here
 
-            _merge_changes(changes)
+        _merge_changes(first)
 
-        return self
+        # With changes included, we can estimate the fee more precisely
+        try:
+            self.fee = self._estimate_fee()
+        except InvalidTransactionException:
+            if first_shaped:
+                return "size"
+            raise
+
+        # The second pass leaves original_outputs untouched until it merges, so a
+        # returned reason keeps it intact for the rerun.
+        self._outputs = original_outputs
+        # None only when pass 1 used the strategy and it declines here: the default
+        # change is then computed by the rerun, at the rerun's own fee.
+        second, _ = self._calc_change_shaped(
+            self.fee,
+            self.inputs,
+            self.outputs,
+            change_address,
+            precise_fee=True,
+            respect_min_utxo=not merge_change,
+            use_change_strategy=first_shaped,
+            default_on_decline=not first_shaped,
+        )
+        if second is None:
+            return "pass2"
+        if first_shaped and _outputs_cbor_len(second) > _outputs_cbor_len(first):
+            return "monotonicity"
+
+        _merge_changes(second)
+
+        return None
 
     def _adding_asset_make_output_overflow(
         self,
