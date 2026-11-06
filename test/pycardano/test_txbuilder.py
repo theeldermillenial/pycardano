@@ -3,7 +3,7 @@ import logging
 from dataclasses import replace
 from fractions import Fraction
 from test.pycardano.test_key import SK
-from test.pycardano.util import check_two_way_cbor
+from test.pycardano.util import FixedChainContext, check_two_way_cbor
 from unittest.mock import patch
 
 import pytest
@@ -24,7 +24,8 @@ from pycardano.certificate import (
     StakeDelegation,
     StakeRegistration,
 )
-from pycardano.coinselection import RandomImproveMultiAsset
+from pycardano.change import ChangeStrategy, SplitByPolicyChange
+from pycardano.coinselection import LargestFirstSelector, RandomImproveMultiAsset
 from pycardano.exception import (
     InsufficientUTxOBalanceException,
     InvalidArgumentException,
@@ -60,7 +61,9 @@ from pycardano.plutus import (
     script_hash,
 )
 from pycardano.transaction import (
+    Asset,
     MultiAsset,
+    Transaction,
     TransactionInput,
     TransactionOutput,
     UTxO,
@@ -3166,3 +3169,624 @@ def test_inline_datum_error(chain_context):
         tx_builder.add_script_input(utxo, plutus_script, different_datum, redeemer)
 
     assert "Inline Datum found" in str(exc_info.value)
+
+
+_CHANGE_SENDER = "addr_test1vrm9x2zsux7va6w892g38tvchnzahvcd9tykqf3ygnmwtaqyfg52x"
+_CHANGE_ADDRESS = Address.from_primitive(_CHANGE_SENDER)
+_OTHER_ADDRESS = Address.from_primitive(
+    "addr_test1vr2p8st5t5cxqglyjky7vk98k7jtfhdpvhl4e97cezuhn0cqcexl7"
+)
+
+
+def _multi_asset_builder(context, change_strategy=None):
+    """The build of test_tx_builder_multi_asset: change holds Token2 and ~5.8 ADA."""
+    builder = TransactionBuilder(context, change_strategy=change_strategy)
+    builder.add_input_address(_CHANGE_SENDER).add_output(
+        TransactionOutput.from_primitive([_CHANGE_SENDER, 3000000])
+    ).add_output(
+        TransactionOutput.from_primitive(
+            [_CHANGE_SENDER, [2000000, {b"1" * 28: {b"Token1": 1}}]]
+        )
+    )
+    return builder
+
+
+def _ada_only_builder(context, change_strategy=None):
+    """The build of test_tx_builder: ADA-only change."""
+    builder = TransactionBuilder(
+        context, [RandomImproveMultiAsset([0, 0])], change_strategy=change_strategy
+    )
+    builder.add_input_address(_CHANGE_SENDER).add_output(
+        TransactionOutput.from_primitive([_CHANGE_SENDER, 500000])
+    )
+    return builder
+
+
+def _split_nfts_builder(context, change_strategy=None):
+    """The build of test_tx_add_change_split_nfts (needs ``_small_val_context``)."""
+    builder = TransactionBuilder(
+        context, [RandomImproveMultiAsset([0, 0])], change_strategy=change_strategy
+    )
+    builder.add_input_address(_CHANGE_SENDER).add_output(
+        TransactionOutput.from_primitive([_CHANGE_SENDER, 7000000])
+    )
+    return builder
+
+
+def _small_val_context():
+    context = FixedChainContext()
+    context.protocol_param = replace(context.protocol_param, max_val_size=50)
+    return context
+
+
+def _min_ada(address, value, context):
+    return min_lovelace_post_alonzo(
+        TransactionOutput(address, copy.deepcopy(value)), context
+    )
+
+
+def _one_per_policy(change, address, context):
+    """One output per policy at its min-ADA, then one output with the remaining ADA."""
+    if not change.multi_asset:
+        return None
+    outputs = []
+    coin = change.coin
+    for policy, assets in change.multi_asset.items():
+        value = Value(0, MultiAsset({policy: copy.deepcopy(assets)}))
+        value.coin = _min_ada(address, value, context)
+        coin -= value.coin
+        outputs.append(TransactionOutput(address, value))
+    if coin <= 0 or coin < _min_ada(address, Value(coin), context):
+        return None
+    outputs.append(TransactionOutput(address, Value(coin)))
+    return outputs
+
+
+class _OnePerPolicy(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return _one_per_policy(change, address, context)
+
+
+class _CoinRecorder(ChangeStrategy):
+    """Records every coin it is offered; splits like _OnePerPolicy."""
+
+    def __init__(self):
+        self.coins = []
+
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        return _one_per_policy(change, address, context)
+
+
+class _SplitAboveCoin(_CoinRecorder):
+    def __init__(self, threshold):
+        super().__init__()
+        self.threshold = threshold
+
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        if change.coin >= self.threshold:
+            return _one_per_policy(change, address, context)
+        return None
+
+
+class _SplitBelowCoin(_SplitAboveCoin):
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        if change.coin <= self.threshold:
+            return _one_per_policy(change, address, context)
+        return None
+
+
+class _GrowsAsCoinFalls(_SplitAboveCoin):
+    """One output at or above the threshold, more outputs below it."""
+
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        if change.coin >= self.threshold:
+            return [TransactionOutput(address, change)]
+        return _one_per_policy(change, address, context)
+
+
+class _DropsOneLovelace(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return [TransactionOutput(address, change - 1)]
+
+
+class _PaysOtherAddress(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return [TransactionOutput(_OTHER_ADDRESS, change)]
+
+
+class _AddsZeroAsset(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        value = copy.deepcopy(change)
+        value.multi_asset[ScriptHash(b"9" * 28)] = Asset({AssetName(b"Zero"): 0})
+        return [TransactionOutput(address, value)]
+
+
+class _DatumOnOutput(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return [TransactionOutput(address, change, datum=42)]
+
+
+class _ScriptOnOutput(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        script = ScriptPubkey(VerificationKeyHash(b"1" * VERIFICATION_KEY_HASH_SIZE))
+        return [TransactionOutput(address, change, script=script)]
+
+
+class _OversizeValue(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return [TransactionOutput(address, change)]
+
+
+class _SubMinimum(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        return [
+            TransactionOutput(address, change - 500000),
+            TransactionOutput(address, Value(500000)),
+        ]
+
+
+class _MutatesThenNone(ChangeStrategy):
+    def change_outputs(self, change, address, context):
+        change.coin = 0
+        change.multi_asset = MultiAsset()
+        return None
+
+
+def _fake_tx_size(builder):
+    """The size of the fake tx priced at the builder's final state."""
+    return len(builder._build_full_fake_tx().to_cbor())
+
+
+def _pass_coins(chain_context):
+    """The coins of pass 1 and pass 2 when both passes split."""
+    recorder = _CoinRecorder()
+    _multi_asset_builder(chain_context, recorder).build(change_address=_CHANGE_ADDRESS)
+    assert len(recorder.coins) == 2
+    return recorder.coins
+
+
+def test_change_strategy_base_is_byte_identical(chain_context):
+    cases = (
+        (_multi_asset_builder, chain_context),
+        (_ada_only_builder, chain_context),
+        (_split_nfts_builder, _small_val_context()),
+    )
+    for make, context in cases:
+        plain = make(context).build(change_address=_CHANGE_ADDRESS)
+        with_base = make(context, ChangeStrategy()).build(
+            change_address=_CHANGE_ADDRESS
+        )
+        assert with_base.to_cbor() == plain.to_cbor()
+
+
+def test_change_strategy_splits_change(chain_context):
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    opted = _multi_asset_builder(chain_context, _OnePerPolicy()).build(
+        change_address=_CHANGE_ADDRESS
+    )
+    assert len(opted.outputs) == len(plain.outputs) + 1
+    assert opted.outputs[2].amount.multi_asset == plain.outputs[2].amount.multi_asset
+    assert not opted.outputs[3].amount.multi_asset
+    assert opted.outputs[2].amount.coin + opted.outputs[3].amount.coin + opted.fee == (
+        plain.outputs[2].amount.coin + plain.fee
+    )
+
+
+def test_change_strategy_merge_change_bypasses_strategy(chain_context):
+    plain = _multi_asset_builder(chain_context).build(
+        change_address=_CHANGE_ADDRESS, merge_change=True
+    )
+    opted = _multi_asset_builder(chain_context, _OnePerPolicy()).build(
+        change_address=_CHANGE_ADDRESS, merge_change=True
+    )
+    assert opted.to_cbor() == plain.to_cbor()
+
+
+def test_change_strategy_size_fallback_reruns_default(chain_context, caplog):
+    caplog.set_level(logging.INFO, logger="PyCardano")
+    plain_builder = _multi_asset_builder(chain_context)
+    plain_builder.build(change_address=_CHANGE_ADDRESS)
+    split_builder = _multi_asset_builder(chain_context, _OnePerPolicy())
+    split_builder.build(change_address=_CHANGE_ADDRESS)
+    plain_size = _fake_tx_size(plain_builder)
+    split_size = _fake_tx_size(split_builder)
+    assert split_size - plain_size > 20
+
+    chain_context.protocol_param = replace(
+        chain_context.protocol_param, max_tx_size=(plain_size + split_size) // 2
+    )
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    opted = _multi_asset_builder(chain_context, _OnePerPolicy()).build(
+        change_address=_CHANGE_ADDRESS
+    )
+
+    assert opted.to_cbor() == plain.to_cbor()
+    assert any(
+        r.levelname == "INFO"
+        and "_OnePerPolicy fell back to the default change (size)" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_change_strategy_size_fallback_raises_default_exception(chain_context):
+    plain_builder = _multi_asset_builder(chain_context)
+    plain_builder.build(change_address=_CHANGE_ADDRESS)
+    chain_context.protocol_param = replace(
+        chain_context.protocol_param, max_tx_size=_fake_tx_size(plain_builder) - 10
+    )
+
+    with pytest.raises(InvalidTransactionException) as plain_exc:
+        _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    with pytest.raises(InvalidTransactionException) as opted_exc:
+        _multi_asset_builder(chain_context, _OnePerPolicy()).build(
+            change_address=_CHANGE_ADDRESS
+        )
+
+    assert "exceeds the max limit" in str(plain_exc.value)
+    assert str(opted_exc.value) == str(plain_exc.value)
+
+
+def test_change_strategy_pass2_fallback_reruns_default(chain_context, caplog):
+    caplog.set_level(logging.INFO, logger="PyCardano")
+    c1, c2 = _pass_coins(chain_context)
+    assert c2 < c1
+    strategy = _SplitAboveCoin(threshold=c1)
+
+    opted = _multi_asset_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+
+    assert strategy.coins == [c1, c2]
+    assert opted.to_cbor() == plain.to_cbor()
+    assert any(
+        r.levelname == "INFO"
+        and "_SplitAboveCoin fell back to the default change (pass2)" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_change_strategy_pass2_used_only_when_pass1(chain_context):
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    c1, _ = _pass_coins(chain_context)
+    strategy = _SplitBelowCoin(threshold=c1 - 1)
+    # pass 2's coin is within the threshold, so the strategy would split there
+    assert plain.outputs[2].amount.coin <= strategy.threshold
+
+    opted = _multi_asset_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+
+    assert strategy.coins == [c1]
+    assert opted.to_cbor() == plain.to_cbor()
+
+
+def test_change_strategy_monotonicity_falls_back_with_warning(chain_context, caplog):
+    c1, _ = _pass_coins(chain_context)
+    strategy = _GrowsAsCoinFalls(threshold=c1)
+
+    opted = _multi_asset_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+
+    assert len(strategy.coins) == 2
+    assert opted.to_cbor() == plain.to_cbor()
+    assert any(
+        r.levelname == "WARNING"
+        and "_GrowsAsCoinFalls" in r.getMessage()
+        and "change grew as the coin fell" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_change_strategy_rerun_restores_fee_and_outputs(chain_context):
+    original_estimate = TransactionBuilder._estimate_fee
+
+    def _spy(calls):
+        def _estimate_fee(self):
+            calls.append((self.fee, copy.deepcopy(self.outputs)))
+            return original_estimate(self)
+
+        return _estimate_fee
+
+    c1, _ = _pass_coins(chain_context)
+    plain_calls = []
+    with patch.object(TransactionBuilder, "_estimate_fee", _spy(plain_calls)):
+        _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    opted_calls = []
+    with patch.object(TransactionBuilder, "_estimate_fee", _spy(opted_calls)):
+        _multi_asset_builder(chain_context, _SplitAboveCoin(threshold=c1)).build(
+            change_address=_CHANGE_ADDRESS
+        )
+
+    # selection, fee1, fee2 (plain); selection, fee1, fee2, rerun fee1, rerun fee2
+    assert len(plain_calls) == 3
+    assert len(opted_calls) == 5
+    entry_fee, entry_outputs = opted_calls[1]
+    assert entry_fee == 0
+    assert len(entry_outputs) == 2
+    assert opted_calls[3] == opted_calls[1] == plain_calls[1]
+    assert opted_calls[4] == plain_calls[2]
+
+
+@pytest.mark.parametrize(
+    "strategy, small_val, phrase",
+    [
+        (_DropsOneLovelace(), False, "sum to"),
+        (_PaysOtherAddress(), False, "not the change address"),
+        (_AddsZeroAsset(), False, "non-positive quantity"),
+        (_DatumOnOutput(), False, "carries a datum"),
+        (_ScriptOnOutput(), False, "carries a script"),
+        (_OversizeValue(), True, "above max_val_size"),
+    ],
+    ids=lambda v: type(v).__name__ if isinstance(v, ChangeStrategy) else None,
+)
+def test_change_strategy_guard_rejects(chain_context, strategy, small_val, phrase):
+    if small_val:
+        builder = _split_nfts_builder(_small_val_context(), strategy)
+    else:
+        builder = _multi_asset_builder(chain_context, strategy)
+    with pytest.raises(
+        InvalidTransactionException, match=f"^{type(strategy).__name__}: .*{phrase}"
+    ):
+        builder.build(change_address=_CHANGE_ADDRESS)
+
+
+def test_change_strategy_guard_rejects_sub_minimum_output(chain_context):
+    builder = _multi_asset_builder(chain_context, _SubMinimum())
+    with pytest.raises(InsufficientUTxOBalanceException, match="^_SubMinimum: "):
+        builder.build(change_address=_CHANGE_ADDRESS)
+
+
+def test_change_strategy_mutating_strategy_sees_a_copy(chain_context):
+    plain = _multi_asset_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    opted = _multi_asset_builder(chain_context, _MutatesThenNone()).build(
+        change_address=_CHANGE_ADDRESS
+    )
+    assert opted.to_cbor() == plain.to_cbor()
+
+
+class _PostAlonzoAboveCoin(ChangeStrategy):
+    """One post-Alonzo output (a few bytes longer than the default change) at or above
+    the threshold, None below it."""
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.coins = []
+
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        if change.coin >= self.threshold:
+            return [TransactionOutput(address, change, post_alonzo=True)]
+        return None
+
+
+def _tight_ada_builder(context, change_strategy=None):
+    """One ADA-only input and one 2-ADA output; the change is just above its min-ADA."""
+    builder = TransactionBuilder(context, change_strategy=change_strategy)
+    builder.add_input(
+        UTxO(
+            TransactionInput.from_primitive([b"8" * 32, 0]),
+            TransactionOutput(_CHANGE_ADDRESS, Value(3023368)),
+        )
+    )
+    builder.add_output(TransactionOutput(_CHANGE_ADDRESS, Value(2000000)))
+    return builder
+
+
+def test_change_strategy_pass2_decline_skips_default_at_opted_coin(chain_context):
+    # a strategy that always declines is asked once, at pass 1's coin
+    probe = _PostAlonzoAboveCoin(threshold=10**15)
+    _tight_ada_builder(chain_context, probe).build(change_address=_CHANGE_ADDRESS)
+    (c1,) = probe.coins
+    plain = _tight_ada_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    strategy = _PostAlonzoAboveCoin(threshold=c1)
+
+    opted = _tight_ada_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+
+    assert len(strategy.coins) == 2
+    first, second = strategy.coins
+    assert first == c1
+    # the default change fits at the plain build's coin, not at the opted pass 2 coin
+    min_ada = _min_ada(_CHANGE_ADDRESS, Value(second), chain_context)
+    assert second < min_ada <= plain.outputs[-1].amount.coin
+    assert opted.to_cbor() == plain.to_cbor()
+
+
+def _split_utxos():
+    """Two key UTxOs at the change address, each holding one policy."""
+    return [
+        UTxO(
+            TransactionInput.from_primitive([b"5" * 32, 0]),
+            TransactionOutput.from_primitive(
+                [_CHANGE_SENDER, [20000000, {b"1" * 28: {b"Token1": 5}}]]
+            ),
+        ),
+        UTxO(
+            TransactionInput.from_primitive([b"6" * 32, 1]),
+            TransactionOutput.from_primitive(
+                [_CHANGE_SENDER, [10000000, {b"2" * 28: {b"Token2": 3}}]]
+            ),
+        ),
+    ]
+
+
+def _split_inputs_total():
+    return sum((utxo.output.amount for utxo in _split_utxos()), Value())
+
+
+def _split_builder(context, change_strategy=None):
+    """Both split UTxOs as inputs and one 3-ADA output to another address."""
+    builder = TransactionBuilder(context, change_strategy=change_strategy)
+    for utxo in _split_utxos():
+        builder.add_input(utxo)
+    builder.add_output(TransactionOutput(_OTHER_ADDRESS, 3000000))
+    return builder
+
+
+class _RecordingSplit(SplitByPolicyChange):
+    """A SplitByPolicyChange that records every coin it is offered."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.coins = []
+
+    def change_outputs(self, change, address, context):
+        self.coins.append(change.coin)
+        return super().change_outputs(change, address, context)
+
+
+def test_split_change_build_shape_fee_and_balance(chain_context):
+    tx = _split_builder(chain_context, SplitByPolicyChange()).build_and_sign(
+        [SK], change_address=_CHANGE_ADDRESS
+    )
+    body = tx.transaction_body
+    outputs = body.outputs
+
+    assert len(outputs) == 4
+    assert outputs[0] == TransactionOutput(_OTHER_ADDRESS, 3000000)
+    assert outputs[1].address == _CHANGE_ADDRESS
+    assert not outputs[1].amount.multi_asset
+    assert outputs[2].amount.multi_asset == MultiAsset.from_primitive(
+        {b"1" * 28: {b"Token1": 5}}
+    )
+    assert outputs[3].amount.multi_asset == MultiAsset.from_primitive(
+        {b"2" * 28: {b"Token2": 3}}
+    )
+    assert all(o.address == _CHANGE_ADDRESS for o in outputs[1:])
+    assert body.fee >= fee(chain_context, len(tx.to_cbor()))
+    assert _split_inputs_total() == sum((o.amount for o in outputs), Value()) + Value(
+        body.fee
+    )
+
+
+def test_split_change_shortfall_falls_back_to_default(chain_context):
+    plain = _split_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    strategy = _RecordingSplit(min_lovelace_per_output=15000000)
+
+    opted = _split_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+
+    # c1 < S = 30 ADA: the strategy declines at pass 1 and is not asked again
+    assert len(strategy.coins) == 1
+    assert strategy.coins[0] < 30000000
+    assert opted.to_cbor() == plain.to_cbor()
+
+
+def test_split_change_pass2_shortfall_falls_back_to_default(chain_context, caplog):
+    caplog.set_level(logging.INFO, logger="PyCardano")
+    probe = _RecordingSplit()
+    _split_builder(chain_context, probe).build(change_address=_CHANGE_ADDRESS)
+    c1 = probe.coins[0]
+    plain = _split_builder(chain_context).build(change_address=_CHANGE_ADDRESS)
+    # two token outputs at half of c1 each: S <= c1, and pass 2's coin is lower
+    strategy = _RecordingSplit(min_lovelace_per_output=c1 // 2)
+
+    opted = _split_builder(chain_context, strategy).build(
+        change_address=_CHANGE_ADDRESS
+    )
+
+    assert len(strategy.coins) == 2
+    first, second = strategy.coins
+    assert second < 2 * (c1 // 2) <= first == c1
+    assert opted.to_cbor() == plain.to_cbor()
+    assert any(
+        "_RecordingSplit fell back to the default change (pass2)" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_split_change_reaches_ex_units_draft(chain_context):
+    plutus_script = PlutusV1Script(b"dummy test script")
+    script_address = Address(plutus_script_hash(plutus_script))
+    datum = PlutusData()
+    script_utxo = UTxO(
+        TransactionInput.from_primitive(
+            ["18cbe6cadecd3f89b60e08e68e5e6c7d72d730aaa1ad21431590f7e6643438ef", 0]
+        ),
+        TransactionOutput(script_address, 10000000, datum_hash=datum.hash()),
+    )
+    builder = _split_builder(chain_context, SplitByPolicyChange())
+    builder.add_script_input(script_utxo, plutus_script, datum, Redeemer(PlutusData()))
+
+    drafts = []
+
+    def capture(cbor):
+        drafts.append(Transaction.from_cbor(cbor))
+        return {"spend:0": ExecutionUnits(399882, 175940720)}
+
+    with patch.object(chain_context, "evaluate_tx_cbor", side_effect=capture):
+        body = builder.build(change_address=_CHANGE_ADDRESS)
+
+    assert len(drafts) == 1
+    draft_outputs = drafts[0].transaction_body.outputs
+    assert len(body.outputs) == 4
+    assert len(draft_outputs) >= len(body.outputs)
+    # away from the fold threshold, the draft's change has the final shape
+    assert [o.amount.multi_asset for o in draft_outputs] == [
+        o.amount.multi_asset for o in body.outputs
+    ]
+    assert draft_outputs[1].amount.coin > body.outputs[1].amount.coin
+
+
+@pytest.mark.parametrize(
+    "make_selector",
+    [LargestFirstSelector, lambda: RandomImproveMultiAsset([0, 0])],
+    ids=["largest_first", "random_improve"],
+)
+def test_split_change_selection_unchanged(chain_context, make_selector):
+    utxos = _split_utxos() + [
+        UTxO(
+            TransactionInput.from_primitive([b"7" * 32, 2]),
+            TransactionOutput.from_primitive([_CHANGE_SENDER, 5000000]),
+        )
+    ]
+
+    def build(change_strategy):
+        builder = TransactionBuilder(
+            chain_context, [make_selector()], change_strategy=change_strategy
+        )
+        builder.add_input_address(_CHANGE_SENDER)
+        builder.add_output(TransactionOutput(_OTHER_ADDRESS, 3000000))
+        return builder.build(change_address=_CHANGE_ADDRESS)
+
+    with patch.object(chain_context, "utxos", return_value=utxos):
+        plain = build(None)
+        opted = build(SplitByPolicyChange())
+
+    assert opted.inputs == plain.inputs
+    assert len(opted.outputs) > len(plain.outputs)
+
+
+def test_split_change_change_only_build(chain_context):
+    builder = TransactionBuilder(chain_context, change_strategy=SplitByPolicyChange())
+    for utxo in _split_utxos():
+        builder.add_input(utxo)
+
+    body = builder.build(change_address=_CHANGE_ADDRESS)
+
+    expected = SplitByPolicyChange().change_outputs(
+        _split_inputs_total() - Value(body.fee), _CHANGE_ADDRESS, chain_context
+    )
+    assert len(expected) == 3
+    assert body.outputs == expected
+
+
+def test_split_change_accepts_a_str_change_address(chain_context):
+    with_address = _split_builder(chain_context, SplitByPolicyChange()).build(
+        change_address=_CHANGE_ADDRESS
+    )
+    with_str = _split_builder(chain_context, SplitByPolicyChange()).build(
+        change_address=str(_CHANGE_ADDRESS)
+    )
+
+    assert len(with_address.outputs) == 4
+    assert with_str.to_cbor() == with_address.to_cbor()
