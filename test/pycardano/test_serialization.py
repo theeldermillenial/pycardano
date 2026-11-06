@@ -1497,10 +1497,9 @@ def test_decode_routes_agree(cbor_hex):
     for decode in (loads, _loads_scan):
         try:
             decoded = decode(encoded)
+            outcomes.append((_representation(decoded), dumps(decoded)))
         except Exception as error:
             outcomes.append((type(error), str(error)))
-        else:
-            outcomes.append((_representation(decoded), dumps(decoded)))
 
     assert outcomes[0] == outcomes[1]
 
